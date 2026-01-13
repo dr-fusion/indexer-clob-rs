@@ -5,7 +5,7 @@ A high-performance Rust-based indexer for the CLOB (Central Limit Order Book) DE
 ## Features
 
 - **Historical Sync**: RPC-based backfill using `eth_getLogs` with adaptive batch sizing
-- **Real-time Sync**: Polling mode with 100ms intervals optimized for MegaETH's fast block times
+- **Real-time Sync**: WebSocket subscription with ~10ms latency for MegaETH mini-blocks
 - **Adaptive AIMD Algorithm**: Dynamic batch size and concurrency adjustment based on RPC responses
 - **PostgreSQL Persistence**: Bulk inserts with UNNEST for high throughput
 - **Redis Streaming**: Real-time event streaming with batch publishing
@@ -185,19 +185,28 @@ RUST_LOG=info cargo run --release
    - Loads configuration from env and deployment JSON
    - Connects to PostgreSQL (if configured)
    - Checks `sync_state` table for last synced block to resume from
+   - **Loads existing pools from database into memory** (critical for WebSocket filtering)
    - Falls back to deployment JSON's `startBlock` if no previous state
 
 2. **Historical Sync**
    - Fetches events using `eth_getLogs` with adaptive batch sizes
    - Processes batches in parallel with adaptive concurrency
+   - **Immediate retry with exponential backoff** on failures (not deferred)
+   - **Contiguous sync state tracking** - only advances when blocks are fully synced
    - Automatically splits batches on "too many logs" errors
    - Backs off on rate limit (429) errors
+   - **Verification loop** before switching to real-time mode
    - Persists sync state periodically
 
-3. **Real-time Sync**
-   - Polls for new blocks every 100ms
-   - Processes events from all discovered contracts
-   - Detects and fills gaps automatically
+3. **Real-time Sync** (WebSocket)
+   - Connects to MegaETH WebSocket endpoint
+   - **Topic-based subscription** - subscribes by event signatures, not addresses
+   - Automatically captures events from newly created pools
+   - ~10ms latency (MegaETH mini-blocks)
+   - **Keepalive mechanism** - sends `eth_chainId` every 30s
+   - **Exponential backoff with jitter** on reconnection
+   - **Gap recovery** - fetches missed blocks via HTTP on reconnect
+   - Falls back to polling mode if WebSocket unavailable
 
 ### Data Flow
 
