@@ -1,0 +1,31 @@
+[package]
+name = "indexer-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer-core.workspace = true
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "bigdecimal"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Primitives
+alloy-primitives.workspace = true
+
+# Utilities
+hex = "0.4"

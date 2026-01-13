@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/indexer-core",
+    "crates/indexer-store",
+    "crates/indexer-sync",
+    "crates/indexer-processor",
+    "crates/indexer-db",
+    "crates/indexer-redis",
+    "crates/indexer-candles",
+    "crates/indexer-api",
+    "crates/indexer-metrics",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+# Alloy (Ethereum)
+alloy = { version = "1.0", features = ["full", "pubsub"] }
+alloy-primitives = "1.0"
+alloy-sol-types = "1.0"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+futures = "0.3"
+
+# Concurrency
+dashmap = "6.1"
+parking_lot = "0.12"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Internal crates
+indexer-core = { path = "crates/indexer-core" }
+indexer-store = { path = "crates/indexer-store" }
+indexer-sync = { path = "crates/indexer-sync" }
+indexer-processor = { path = "crates/indexer-processor" }
+indexer-db = { path = "crates/indexer-db" }
+indexer-redis = { path = "crates/indexer-redis" }
+indexer-candles = { path = "crates/indexer-candles" }
+indexer-api = { path = "crates/indexer-api" }
+indexer-metrics = { path = "crates/indexer-metrics" }
+
+[package]
+name = "clob-indexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer-core.workspace = true
+indexer-store.workspace = true
+indexer-sync.workspace = true
+indexer-processor.workspace = true
+indexer-db.workspace = true
+indexer-redis.workspace = true
+indexer-candles.workspace = true
+indexer-api.workspace = true
+indexer-metrics.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dotenvy = "0.15"
+alloy.workspace = true

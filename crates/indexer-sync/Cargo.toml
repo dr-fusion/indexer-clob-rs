@@ -1,0 +1,20 @@
+[package]
+name = "indexer-sync"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer-core.workspace = true
+indexer-store.workspace = true
+indexer-processor.workspace = true
+alloy.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror = "1.0"
+reqwest = "0.12"
+regex = "1.10"

@@ -1,0 +1,24 @@
+[package]
+name = "indexer-metrics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# HTTP Server
+axum = { version = "0.8", features = ["tokio"] }
+
+# Async
+tokio.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Serialization
+serde.workspace = true

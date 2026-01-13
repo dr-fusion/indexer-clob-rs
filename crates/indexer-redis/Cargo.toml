@@ -1,0 +1,30 @@
+[package]
+name = "indexer-redis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer-core.workspace = true
+
+# Redis
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "streams"] }
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Time
+tokio-util = { version = "0.7", features = ["time"] }
+
+# Concurrency
+dashmap.workspace = true

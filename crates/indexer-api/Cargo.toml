@@ -1,0 +1,32 @@
+[package]
+name = "indexer-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexer-core.workspace = true
+indexer-db.workspace = true
+indexer-store.workspace = true
+indexer-candles.workspace = true
+
+# GraphQL
+async-graphql = { version = "7.0", features = ["dataloader"] }
+async-graphql-axum = "7.0"
+
+# HTTP Server
+axum = { version = "0.8", features = ["tokio"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
