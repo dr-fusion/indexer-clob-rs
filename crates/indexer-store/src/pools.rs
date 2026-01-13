@@ -61,6 +61,18 @@ impl PoolStore {
     pub fn get_all(&self) -> Vec<Pool> {
         self.pools.iter().map(|e| e.value().clone()).collect()
     }
+
+    /// Bulk insert pools (for restoring state from database)
+    pub fn bulk_insert(&self, pools: impl IntoIterator<Item = Pool>) -> usize {
+        let mut count = 0;
+        for pool in pools {
+            self.orderbook_index
+                .insert(pool.order_book_address, pool.pool_id);
+            self.pools.insert(pool.pool_id, pool);
+            count += 1;
+        }
+        count
+    }
 }
 
 impl Default for PoolStore {

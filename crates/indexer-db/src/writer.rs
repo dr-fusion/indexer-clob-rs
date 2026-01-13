@@ -12,7 +12,7 @@ use crate::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Types of write operations that can be batched
 #[derive(Debug)]
@@ -296,59 +296,73 @@ impl BatchWriter {
         currencies: &mut Vec<DbCurrency>,
         candles: &mut Vec<(CandleInterval, DbCandle)>,
     ) {
+        use std::time::Instant;
+
+        let flush_start = Instant::now();
         let pool = db_pool.inner();
+
+        let total_pending = pools.len()
+            + orders.len()
+            + order_histories.len()
+            + trades.len()
+            + ob_trades.len()
+            + balances.len()
+            + users.len()
+            + currencies.len()
+            + candles.len();
+
+        if total_pending == 0 {
+            return;
+        }
+
+        let mut stats = FlushStats::default();
 
         // Flush pools (bulk) - deduplicate by id
         if !pools.is_empty() {
             let deduped = Self::dedup_by_key(pools, |p| p.id.clone());
-            let count = deduped.len();
-            debug!(count, "Flushing pools (bulk)");
+            stats.pools = deduped.len();
             match PoolRepository::bulk_upsert(pool, &deduped).await {
-                Ok(n) => debug!(inserted = n, "Bulk upserted pools"),
-                Err(e) => error!(error = %e, "Failed to bulk upsert pools"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.pools, "Failed to bulk upsert pools"),
             }
         }
 
         // Flush orders (bulk) - deduplicate by order_id
         if !orders.is_empty() {
             let deduped = Self::dedup_by_key(orders, |o| o.order_id.clone());
-            let count = deduped.len();
-            debug!(count, "Flushing orders (bulk)");
+            stats.orders = deduped.len();
             match OrderRepository::bulk_upsert(pool, &deduped).await {
-                Ok(n) => debug!(inserted = n, "Bulk upserted orders"),
-                Err(e) => error!(error = %e, "Failed to bulk upsert orders"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.orders, "Failed to bulk upsert orders"),
             }
         }
 
         // Flush order histories (bulk) - no dedup needed, each is unique
         if !order_histories.is_empty() {
-            let count = order_histories.len();
-            debug!(count, "Flushing order histories (bulk)");
+            stats.order_histories = order_histories.len();
             match OrderRepository::bulk_insert_history(pool, order_histories).await {
-                Ok(n) => debug!(inserted = n, "Bulk inserted order histories"),
-                Err(e) => error!(error = %e, "Failed to bulk insert order histories"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.order_histories, "Failed to bulk insert order histories"),
             }
             order_histories.clear();
         }
 
         // Flush trades (bulk) - no dedup needed, each trade is unique
         if !trades.is_empty() {
-            let count = trades.len();
-            debug!(count, "Flushing trades (bulk)");
+            stats.trades = trades.len();
             match TradeRepository::bulk_insert(pool, trades).await {
-                Ok(n) => debug!(inserted = n, "Bulk inserted trades"),
-                Err(e) => error!(error = %e, "Failed to bulk insert trades"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.trades, "Failed to bulk insert trades"),
             }
             trades.clear();
         }
 
         // Flush orderbook trades (bulk) - no dedup needed
         if !ob_trades.is_empty() {
-            let count = ob_trades.len();
-            debug!(count, "Flushing orderbook trades (bulk)");
+            stats.ob_trades = ob_trades.len();
             match TradeRepository::bulk_insert_orderbook_trades(pool, ob_trades).await {
-                Ok(n) => debug!(inserted = n, "Bulk inserted orderbook trades"),
-                Err(e) => error!(error = %e, "Failed to bulk insert orderbook trades"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.ob_trades, "Failed to bulk insert orderbook trades"),
             }
             ob_trades.clear();
         }
@@ -356,55 +370,93 @@ impl BatchWriter {
         // Flush balances (bulk) - deduplicate by id
         if !balances.is_empty() {
             let deduped = Self::dedup_by_key(balances, |b| b.id.clone());
-            let count = deduped.len();
-            debug!(count, "Flushing balances (bulk)");
+            stats.balances = deduped.len();
             match BalanceRepository::bulk_upsert(pool, &deduped).await {
-                Ok(n) => debug!(inserted = n, "Bulk upserted balances"),
-                Err(e) => error!(error = %e, "Failed to bulk upsert balances"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.balances, "Failed to bulk upsert balances"),
             }
         }
 
         // Flush users (bulk) - deduplicate by user
         if !users.is_empty() {
             let deduped = Self::dedup_by_key(users, |u| u.user.clone());
-            let count = deduped.len();
-            debug!(count, "Flushing users (bulk)");
+            stats.users = deduped.len();
             match UserRepository::bulk_insert_ignore(pool, &deduped).await {
-                Ok(n) => debug!(inserted = n, "Bulk inserted users"),
-                Err(e) => error!(error = %e, "Failed to bulk insert users"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.users, "Failed to bulk insert users"),
             }
         }
 
         // Flush currencies (bulk) - deduplicate by (chain_id, address)
         if !currencies.is_empty() {
             let deduped = Self::dedup_by_key(currencies, |c| (c.chain_id, c.address.clone()));
-            let count = deduped.len();
-            debug!(count, "Flushing currencies (bulk)");
+            stats.currencies = deduped.len();
             match UserRepository::bulk_upsert_currencies(pool, &deduped).await {
-                Ok(n) => debug!(inserted = n, "Bulk upserted currencies"),
-                Err(e) => error!(error = %e, "Failed to bulk upsert currencies"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, count = stats.currencies, "Failed to bulk upsert currencies"),
             }
         }
 
         // Flush candles by interval (batch per interval) - deduplicate by (interval, pool_id, open_time)
         if !candles.is_empty() {
-            debug!(count = candles.len(), "Flushing candles");
-            // First deduplicate
             let deduped = Self::dedup_by_key(candles, |(interval, c)| {
                 (*interval, c.pool_id.clone(), c.open_time)
             });
-            // Group candles by interval for efficient batch operations
+            stats.candles = deduped.len();
             let mut by_interval: HashMap<CandleInterval, Vec<DbCandle>> = HashMap::new();
             for (interval, candle) in deduped {
                 by_interval.entry(interval).or_default().push(candle);
             }
             for (interval, interval_candles) in by_interval {
                 match CandleRepository::batch_upsert(pool, interval, &interval_candles).await {
-                    Ok(()) => debug!(interval = ?interval, count = interval_candles.len(), "Batch upserted candles"),
+                    Ok(()) => {}
                     Err(e) => error!(error = %e, interval = ?interval, "Failed to batch upsert candles"),
                 }
             }
         }
+
+        let elapsed_ms = flush_start.elapsed().as_millis();
+        info!(
+            pools = stats.pools,
+            orders = stats.orders,
+            order_histories = stats.order_histories,
+            trades = stats.trades,
+            ob_trades = stats.ob_trades,
+            balances = stats.balances,
+            users = stats.users,
+            currencies = stats.currencies,
+            candles = stats.candles,
+            total = stats.total(),
+            elapsed_ms = elapsed_ms,
+            "DB flush complete"
+        );
+    }
+}
+
+#[derive(Default)]
+struct FlushStats {
+    pools: usize,
+    orders: usize,
+    order_histories: usize,
+    trades: usize,
+    ob_trades: usize,
+    balances: usize,
+    users: usize,
+    currencies: usize,
+    candles: usize,
+}
+
+impl FlushStats {
+    fn total(&self) -> usize {
+        self.pools
+            + self.orders
+            + self.order_histories
+            + self.trades
+            + self.ob_trades
+            + self.balances
+            + self.users
+            + self.currencies
+            + self.candles
     }
 }
 

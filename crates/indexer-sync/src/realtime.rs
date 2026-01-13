@@ -1,5 +1,6 @@
 use alloy::rpc::types::Filter;
 use alloy_sol_types::SolEvent;
+use futures_util::{SinkExt, StreamExt};
 use indexer_core::events::{
     Deposit, Lock, OrderCancelled, OrderMatched, OrderPlaced, PoolCreated, TransferFrom,
     TransferLockedFrom, Unlock, UpdateOrder, Withdrawal,
@@ -7,11 +8,12 @@ use indexer_core::events::{
 use indexer_core::{IndexerConfig, IndexerError, Result};
 use indexer_processor::EventProcessor;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, trace};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::provider::ProviderManager;
 
@@ -73,12 +75,30 @@ impl From<MiniBlockLog> for alloy::primitives::Log {
     }
 }
 
-/// Real-time syncer using MegaETH miniBlocks subscription
+/// Reconnection configuration for WebSocket
+struct ReconnectConfig {
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    max_attempts: u32, // 0 = unlimited
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: 1000,
+            max_delay_ms: 30000,
+            max_attempts: 0,
+        }
+    }
+}
+
+/// Real-time syncer using MegaETH WebSocket logs subscription
 pub struct RealtimeSyncer {
     config: IndexerConfig,
     provider: Arc<ProviderManager>,
     processor: Arc<EventProcessor>,
-    #[allow(dead_code)]
+    /// The verified block from historical sync - real-time starts from here
+    start_from_block: u64,
     last_processed_block: AtomicU64,
     #[allow(dead_code)]
     last_miniblock_index: AtomicU32,
@@ -89,27 +109,453 @@ impl RealtimeSyncer {
         config: IndexerConfig,
         provider: Arc<ProviderManager>,
         processor: Arc<EventProcessor>,
+        start_from_block: u64,
     ) -> Self {
         Self {
             config,
             provider,
             processor,
-            last_processed_block: AtomicU64::new(0),
+            start_from_block,
+            last_processed_block: AtomicU64::new(start_from_block),
             last_miniblock_index: AtomicU32::new(0),
         }
     }
 
-    /// Run the real-time syncer
-    /// Returns when disconnected or error occurs
-    pub async fn run(&mut self, gap_tx: mpsc::Sender<u64>) -> Result<()> {
-        info!("Starting real-time sync");
-
-        // For now, we'll use polling as a fallback since miniBlocks subscription
-        // requires custom transport handling in Alloy
-        self.run_polling_mode(gap_tx).await
+    /// Calculate reconnect delay with exponential backoff + jitter
+    fn get_reconnect_delay(&self, attempts: u32) -> Duration {
+        let config = ReconnectConfig::default();
+        let base_delay = (config.initial_delay_ms as f64 * 2_f64.powi(attempts as i32))
+            .min(config.max_delay_ms as f64);
+        // Use simple jitter based on current time (no rand crate needed)
+        let jitter_factor = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as f64)
+            / 4_294_967_295.0;
+        let jitter = base_delay * 0.2 * jitter_factor;
+        Duration::from_millis((base_delay + jitter) as u64)
     }
 
-    /// Polling mode fallback - poll for new blocks periodically
+    /// Run the real-time syncer with WebSocket and automatic reconnection
+    pub async fn run(&mut self, _gap_tx: mpsc::Sender<u64>) -> Result<()> {
+        info!(
+            start_from_block = self.start_from_block,
+            "Starting real-time sync from verified block"
+        );
+
+        // Verify sync state matches our start block
+        {
+            let state = self.processor.store().sync_state.read().await;
+            if state.last_synced_block != self.start_from_block {
+                warn!(
+                    sync_state_block = state.last_synced_block,
+                    start_from_block = self.start_from_block,
+                    "Sync state mismatch - using start_from_block"
+                );
+                drop(state);
+                let mut state = self.processor.store().sync_state.write().await;
+                state.set_last_synced_block(self.start_from_block);
+            }
+        }
+
+        let mut reconnect_attempts = 0u32;
+        let config = ReconnectConfig::default();
+
+        loop {
+            match self.run_websocket_mode().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if config.max_attempts > 0 && reconnect_attempts >= config.max_attempts {
+                        error!(
+                            attempts = reconnect_attempts,
+                            "Max reconnection attempts reached"
+                        );
+                        return Err(e);
+                    }
+
+                    let delay = self.get_reconnect_delay(reconnect_attempts);
+                    warn!(
+                        error = %e,
+                        attempt = reconnect_attempts + 1,
+                        delay_ms = delay.as_millis(),
+                        "WebSocket error, reconnecting with backoff"
+                    );
+
+                    // Recover any missed blocks during disconnection
+                    if let Err(gap_err) = self.recover_missed_blocks().await {
+                        error!(error = %gap_err, "Failed to recover missed blocks");
+                    }
+
+                    tokio::time::sleep(delay).await;
+                    reconnect_attempts += 1;
+                }
+            }
+        }
+    }
+
+    /// Get all event signature topics for subscription
+    /// We subscribe by topics (not addresses) to automatically capture events from new pools
+    fn get_event_topics(&self) -> Vec<String> {
+        let topics = vec![
+            format!("{:?}", PoolCreated::SIGNATURE_HASH),
+            format!("{:?}", OrderPlaced::SIGNATURE_HASH),
+            format!("{:?}", OrderMatched::SIGNATURE_HASH),
+            format!("{:?}", UpdateOrder::SIGNATURE_HASH),
+            format!("{:?}", OrderCancelled::SIGNATURE_HASH),
+            format!("{:?}", Deposit::SIGNATURE_HASH),
+            format!("{:?}", Withdrawal::SIGNATURE_HASH),
+            format!("{:?}", Lock::SIGNATURE_HASH),
+            format!("{:?}", Unlock::SIGNATURE_HASH),
+            format!("{:?}", TransferFrom::SIGNATURE_HASH),
+            format!("{:?}", TransferLockedFrom::SIGNATURE_HASH),
+        ];
+        debug!(
+            topic_count = topics.len(),
+            "Prepared event topics for subscription"
+        );
+        topics
+    }
+
+    /// Check if a log is from one of our contracts (client-side filtering)
+    fn is_relevant_log(&self, log: &alloy::rpc::types::Log) -> bool {
+        let address = log.address();
+        let topic0 = log.topics().first();
+
+        match topic0 {
+            // PoolCreated - only from PoolManager
+            Some(t) if *t == PoolCreated::SIGNATURE_HASH => address == self.config.pool_manager,
+            // Balance events - only from BalanceManager
+            Some(t)
+                if *t == Deposit::SIGNATURE_HASH
+                    || *t == Withdrawal::SIGNATURE_HASH
+                    || *t == Lock::SIGNATURE_HASH
+                    || *t == Unlock::SIGNATURE_HASH
+                    || *t == TransferFrom::SIGNATURE_HASH
+                    || *t == TransferLockedFrom::SIGNATURE_HASH =>
+            {
+                address == self.config.balance_manager
+            }
+            // Orderbook events - from any known orderbook (including newly discovered)
+            Some(t)
+                if *t == OrderPlaced::SIGNATURE_HASH
+                    || *t == OrderMatched::SIGNATURE_HASH
+                    || *t == UpdateOrder::SIGNATURE_HASH
+                    || *t == OrderCancelled::SIGNATURE_HASH =>
+            {
+                self.processor.store().pools.is_known_orderbook(&address)
+            }
+            _ => false,
+        }
+    }
+
+    /// WebSocket connection and subscription (topic-based, not address-based)
+    async fn run_websocket_mode(&mut self) -> Result<()> {
+        let ws_url = &self.config.ws_url;
+        info!(url = %ws_url, "Connecting to WebSocket for real-time logs subscription");
+
+        let (ws_stream, response) = connect_async(ws_url)
+            .await
+            .map_err(|e| IndexerError::Rpc(format!("WebSocket connect: {}", e)))?;
+
+        debug!(
+            status = ?response.status(),
+            "WebSocket connection established"
+        );
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Subscribe by TOPICS only (not addresses) - this way we get all events
+        // matching our signatures and filter by address client-side.
+        // This ensures we automatically receive events from newly created pools.
+        let topics = self.get_event_topics();
+        info!(
+            topic_count = topics.len(),
+            pool_manager = ?self.config.pool_manager,
+            balance_manager = ?self.config.balance_manager,
+            known_orderbooks = self.processor.store().pools.count(),
+            "Subscribing to logs by event topics (topic-based, not address-based)"
+        );
+
+        let subscribe_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_subscribe",
+            "params": ["logs", {
+                "topics": [topics],
+                "fromBlock": "pending",
+                "toBlock": "pending"
+            }],
+            "id": 1
+        });
+
+        debug!("Sending subscription request");
+        write
+            .send(Message::Text(subscribe_msg.to_string()))
+            .await
+            .map_err(|e| IndexerError::Rpc(format!("WebSocket send: {}", e)))?;
+
+        // Wait for subscription confirmation
+        let subscription_id = self.wait_for_subscription(&mut read).await?;
+        info!(
+            subscription_id = %subscription_id,
+            "Successfully subscribed to logs - now receiving real-time events"
+        );
+
+        // Start keepalive task
+        let keepalive_write = Arc::new(tokio::sync::Mutex::new(write));
+        let keepalive_handle = self.spawn_keepalive(Arc::clone(&keepalive_write));
+        debug!("Keepalive task started (eth_chainId every 30s)");
+
+        // Process incoming messages
+        let mut last_block_number = self.start_from_block;
+        let mut events_received: u64 = 0;
+        let mut events_processed: u64 = 0;
+        let mut events_filtered: u64 = 0;
+
+        info!("Starting to process real-time WebSocket events");
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|e| IndexerError::Sync(format!("JSON parse: {}", e)))?;
+
+                    // Check if it's a keepalive response (id >= 1000)
+                    if let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) {
+                        if id >= 1000 {
+                            trace!(id = id, "Keepalive response received");
+                            continue;
+                        }
+                    }
+
+                    // Check if it's a log notification
+                    if parsed.get("method") == Some(&serde_json::json!("eth_subscription")) {
+                        if let Some(result) = parsed.pointer("/params/result") {
+                            events_received += 1;
+
+                            let log: alloy::rpc::types::Log =
+                                serde_json::from_value(result.clone())
+                                    .map_err(|e| IndexerError::Sync(format!("Log parse: {}", e)))?;
+
+                            // CLIENT-SIDE FILTERING: Only process logs from our contracts
+                            if !self.is_relevant_log(&log) {
+                                events_filtered += 1;
+                                trace!(
+                                    address = ?log.address(),
+                                    topic0 = ?log.topics().first(),
+                                    "Filtered out irrelevant log"
+                                );
+                                continue;
+                            }
+
+                            events_processed += 1;
+
+                            // Track block number for gap detection
+                            if let Some(block_num) = log.block_number {
+                                last_block_number = block_num;
+                                self.last_processed_block.store(block_num, Ordering::Relaxed);
+                            }
+
+                            // Log the event being processed
+                            debug!(
+                                address = ?log.address(),
+                                block = log.block_number,
+                                tx_hash = ?log.transaction_hash,
+                                log_index = ?log.log_index,
+                                topic0 = ?log.topics().first(),
+                                "Processing real-time event"
+                            );
+
+                            // Process the log (this handles PoolCreated to add new orderbooks)
+                            self.processor.process_log(log).await?;
+
+                            // Update sync state
+                            if last_block_number > 0 {
+                                let mut state =
+                                    self.processor.store().sync_state.write().await;
+                                state.set_last_synced_block(last_block_number);
+                            }
+
+                            // Periodic stats logging
+                            if events_processed % 100 == 0 {
+                                info!(
+                                    received = events_received,
+                                    processed = events_processed,
+                                    filtered = events_filtered,
+                                    last_block = last_block_number,
+                                    "Real-time sync stats"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(Message::Close(frame)) => {
+                    warn!(
+                        frame = ?frame,
+                        events_received = events_received,
+                        events_processed = events_processed,
+                        "WebSocket closed by server"
+                    );
+                    keepalive_handle.abort();
+                    return Err(IndexerError::Sync("WebSocket closed".into()));
+                }
+                Ok(Message::Ping(data)) => {
+                    trace!("Received ping, sending pong");
+                    let mut write = keepalive_write.lock().await;
+                    let _ = write.send(Message::Pong(data)).await;
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        events_received = events_received,
+                        events_processed = events_processed,
+                        "WebSocket error"
+                    );
+                    keepalive_handle.abort();
+                    return Err(IndexerError::Rpc(format!("WebSocket: {}", e)));
+                }
+                _ => {}
+            }
+        }
+
+        keepalive_handle.abort();
+        Ok(())
+    }
+
+    /// Wait for subscription confirmation
+    async fn wait_for_subscription<S>(&self, read: &mut S) -> Result<String>
+    where
+        S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let timeout = Duration::from_secs(10);
+        match tokio::time::timeout(timeout, async {
+            while let Some(msg) = read.next().await {
+                if let Ok(Message::Text(text)) = msg {
+                    let parsed: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|e| IndexerError::Sync(format!("JSON parse: {}", e)))?;
+
+                    // Check for subscription confirmation (id=1)
+                    if parsed.get("id") == Some(&serde_json::json!(1)) {
+                        if let Some(result) = parsed.get("result").and_then(|v| v.as_str()) {
+                            return Ok(result.to_string());
+                        }
+                        if let Some(error) = parsed.get("error") {
+                            return Err(IndexerError::Rpc(format!("Subscription error: {}", error)));
+                        }
+                    }
+                }
+            }
+            Err(IndexerError::Sync(
+                "WebSocket closed during subscription".into(),
+            ))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(IndexerError::Sync("Subscription timeout".into())),
+        }
+    }
+
+    /// Spawn keepalive task (sends eth_chainId every 30s to prevent idle timeout)
+    fn spawn_keepalive(
+        &self,
+        write: Arc<
+            tokio::sync::Mutex<
+                futures_util::stream::SplitSink<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                    Message,
+                >,
+            >,
+        >,
+    ) -> tokio::task::JoinHandle<()> {
+        let keepalive_interval = Duration::from_secs(30);
+        let mut request_id = 1000u64;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(keepalive_interval);
+            loop {
+                interval.tick().await;
+                request_id += 1;
+
+                let msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_chainId",
+                    "params": [],
+                    "id": request_id
+                });
+
+                trace!(request_id = request_id, "Sending keepalive (eth_chainId)");
+
+                let mut write = write.lock().await;
+                if write
+                    .send(Message::Text(msg.to_string()))
+                    .await
+                    .is_err()
+                {
+                    warn!("Keepalive send failed - connection may be closed");
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Recover missed blocks after reconnection
+    async fn recover_missed_blocks(&self) -> Result<()> {
+        info!("Checking for missed blocks after disconnection");
+
+        let last_processed = self.last_processed_block.load(Ordering::Relaxed);
+        if last_processed == 0 {
+            debug!("No blocks processed yet, skipping gap recovery");
+            return Ok(());
+        }
+
+        let current_block = self
+            .provider
+            .http()
+            .get_block_number()
+            .await
+            .map_err(|e| IndexerError::Rpc(e.to_string()))?;
+
+        debug!(
+            last_processed = last_processed,
+            current_block = current_block,
+            "Comparing last processed block with current chain head"
+        );
+
+        if current_block > last_processed + 1 {
+            let missed = current_block - last_processed - 1;
+            warn!(
+                last_processed = last_processed,
+                current_block = current_block,
+                missed_blocks = missed,
+                "Gap detected after reconnection - recovering via HTTP polling"
+            );
+
+            // Fetch missed blocks via polling (reuse existing method)
+            self.fetch_and_process_events(last_processed + 1, current_block)
+                .await?;
+
+            // Update sync state
+            let mut state = self.processor.store().sync_state.write().await;
+            state.set_last_synced_block(current_block);
+
+            info!(
+                from = last_processed + 1,
+                to = current_block,
+                missed_blocks = missed,
+                "Gap recovery complete"
+            );
+        } else {
+            info!("No gaps detected, all blocks are synced");
+        }
+
+        Ok(())
+    }
+
+    /// Polling mode fallback - poll for new blocks periodically (used for gap recovery)
+    #[allow(dead_code)]
     async fn run_polling_mode(&mut self, _gap_tx: mpsc::Sender<u64>) -> Result<()> {
         info!("Running in polling mode");
 
@@ -167,6 +613,13 @@ impl RealtimeSyncer {
     }
 
     async fn fetch_and_process_events(&self, from_block: u64, to_block: u64) -> Result<()> {
+        debug!(
+            from = from_block,
+            to = to_block,
+            blocks = to_block - from_block + 1,
+            "Fetching events via HTTP polling"
+        );
+
         // Step 1: Fetch and process PoolManager events FIRST
         // This ensures any new pools are discovered before we fetch orderbook events
         let pool_filter = Filter::new()
@@ -191,12 +644,16 @@ impl RealtimeSyncer {
             info!(
                 new_pools = new_pools,
                 total_pools = self.processor.store().pools.count(),
-                "New pool(s) discovered in real-time"
+                from_block = from_block,
+                to_block = to_block,
+                "New pool(s) discovered during gap recovery"
             );
         }
 
         // Step 2: Get ALL orderbook addresses (now includes any newly discovered pools)
         let orderbook_addresses = self.processor.store().pools.get_all_orderbook_addresses();
+        let orderbook_count = orderbook_addresses.len();
+
         if !orderbook_addresses.is_empty() {
             let orderbook_sigs = vec![
                 OrderPlaced::SIGNATURE_HASH,
@@ -218,8 +675,17 @@ impl RealtimeSyncer {
                 .await
                 .map_err(|e| IndexerError::Rpc(e.to_string()))?;
 
+            let orderbook_events = logs.len();
             for log in logs {
                 self.processor.process_log(log).await?;
+            }
+
+            if orderbook_events > 0 {
+                debug!(
+                    orderbook_events = orderbook_events,
+                    orderbooks_queried = orderbook_count,
+                    "Processed orderbook events during gap recovery"
+                );
             }
         }
 
@@ -246,9 +712,24 @@ impl RealtimeSyncer {
             .await
             .map_err(|e| IndexerError::Rpc(e.to_string()))?;
 
+        let balance_events = logs.len();
         for log in logs {
             self.processor.process_log(log).await?;
         }
+
+        if balance_events > 0 {
+            debug!(
+                balance_events = balance_events,
+                "Processed balance events during gap recovery"
+            );
+        }
+
+        debug!(
+            from = from_block,
+            to = to_block,
+            pool_events = new_pools,
+            "Gap recovery fetch complete"
+        );
 
         Ok(())
     }

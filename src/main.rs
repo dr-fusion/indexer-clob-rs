@@ -1,9 +1,10 @@
+use alloy::primitives::{Address, FixedBytes, B256};
 use indexer_api::{ApiConfig, ApiServer};
 use indexer_candles::CandleAggregatorBuilder;
-use indexer_core::IndexerConfig;
+use indexer_core::{types::Pool, IndexerConfig};
 use indexer_db::{
-    repositories::SyncStateRepository, BatchWriter, BatchWriterConfig, DatabaseConfig,
-    DatabasePool,
+    repositories::{PoolRepository, SyncStateRepository},
+    BatchWriter, BatchWriterConfig, DatabaseConfig, DatabasePool,
 };
 use indexer_metrics::{MetricsConfig, MetricsServer};
 use indexer_processor::{CandleSink, CompositeSink, DatabaseSink, RedisSink};
@@ -133,6 +134,46 @@ async fn main() -> anyhow::Result<()> {
 
     // Create in-memory store
     let store = Arc::new(IndexerStore::new());
+
+    // Load existing pools from database (critical for resuming sync)
+    // Without this, WebSocket filtering would miss all orderbook events on restart
+    if let Some(db) = db_pool.as_ref() {
+        match PoolRepository::get_all_by_chain(db.inner(), config.chain_id as i64).await {
+            Ok(db_pools) => {
+                if !db_pools.is_empty() {
+                    // Convert DbPool to core Pool type
+                    let pools = db_pools.into_iter().filter_map(|db_pool| {
+                        // Parse hex strings to alloy types
+                        let pool_id: FixedBytes<32> = db_pool.id.parse().ok()?;
+
+                        let order_book_address: Address = db_pool.order_book.parse().ok()?;
+                        let base_currency: Address = db_pool.base_currency.parse().ok()?;
+                        let quote_currency: Address = db_pool.quote_currency.parse().ok()?;
+
+                        Some(Pool {
+                            pool_id,
+                            order_book_address,
+                            base_currency,
+                            quote_currency,
+                            created_at_block: 0, // Not stored in DB, use 0
+                            created_at_tx: B256::ZERO, // Not stored in DB, use zero
+                        })
+                    });
+
+                    let count = store.pools.bulk_insert(pools);
+                    info!(
+                        pools_loaded = count,
+                        "Restored pools from database into memory"
+                    );
+                } else {
+                    info!("No existing pools found in database");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load pools from database, starting with empty pool store");
+            }
+        }
+    }
 
     // Create sync engine
     let mut engine = match SyncEngine::new(config.clone(), store.clone()).await {

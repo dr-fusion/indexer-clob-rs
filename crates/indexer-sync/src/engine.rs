@@ -74,7 +74,8 @@ impl SyncEngine {
             Arc::clone(&self.shutdown_flag),
         );
 
-        historical_syncer.sync_to_head().await?;
+        // sync_to_head now returns the verified last synced block
+        let verified_block = historical_syncer.sync_to_head().await?;
 
         // Check if shutdown was requested during historical sync
         if self.shutdown_flag.load(Ordering::Relaxed) {
@@ -88,7 +89,10 @@ impl SyncEngine {
             state.complete_historical_sync();
         }
 
-        info!("Historical sync complete, switching to real-time mode");
+        info!(
+            verified_block = verified_block,
+            "Historical sync complete and verified, switching to real-time mode"
+        );
 
         // Log stats
         {
@@ -105,10 +109,12 @@ impl SyncEngine {
         // Phase 2: Real-time sync with gap detection
         let (gap_tx, mut gap_rx) = mpsc::channel::<u64>(100);
 
+        // Initialize real-time syncer with the verified block as starting point
         let mut realtime_syncer = RealtimeSyncer::new(
             self.config.clone(),
             self.provider.clone(),
             self.processor.clone(),
+            verified_block,
         );
 
         let gap_detector = GapDetector::new(

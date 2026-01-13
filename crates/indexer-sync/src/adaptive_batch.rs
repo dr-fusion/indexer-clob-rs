@@ -255,11 +255,6 @@ impl AdaptiveConcurrencyController {
         self.current.load(Ordering::Relaxed)
     }
 
-    /// Get a reference to the semaphore for acquiring permits
-    pub fn semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.semaphore)
-    }
-
     /// Report a successful operation
     /// After success_threshold consecutive successes, increases concurrency by factor (e.g., 10%)
     pub fn report_success(&self) {
@@ -378,6 +373,22 @@ impl BlockRangeTracker {
         }
         // Should have exactly one merged range covering start_block to target_end
         ranges.len() == 1 && ranges[0].0 <= start_block && ranges[0].1 >= self.target_end
+    }
+
+    /// Get the highest block that is contiguously synced from start_block
+    /// Returns the end of the first contiguous range, or start_block - 1 if no ranges
+    pub async fn get_contiguous_end(&self, start_block: u64) -> u64 {
+        let ranges = self.processed.read().await;
+        if ranges.is_empty() {
+            return start_block.saturating_sub(1);
+        }
+        // Check if first range starts at or before start_block
+        if ranges[0].0 > start_block {
+            // There's a gap at the beginning
+            return start_block.saturating_sub(1);
+        }
+        // Return end of first contiguous range
+        ranges[0].1
     }
 }
 
