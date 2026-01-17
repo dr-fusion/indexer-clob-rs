@@ -49,17 +49,17 @@ impl CandleAggregator {
     }
 
     /// Start the background flusher
-    pub fn start(&mut self, flush_interval_secs: u64, retention_secs: u64) {
+    pub async fn start(&self, flush_interval_secs: u64, retention_secs: u64) {
         info!(
             flush_interval_secs = flush_interval_secs,
             retention_secs = retention_secs,
             "Starting candle aggregator background flusher"
         );
-        self.flusher.start(flush_interval_secs, retention_secs);
+        self.flusher.start(flush_interval_secs, retention_secs).await;
     }
 
     /// Stop the aggregator and flush all data
-    pub async fn stop(&mut self) {
+    pub async fn stop(&self) {
         let (total, dirty) = self.cache_stats();
         info!(
             total_buckets = total,
@@ -204,10 +204,10 @@ impl CandleAggregatorBuilder {
         self
     }
 
-    pub fn build(self) -> CandleAggregator {
+    pub async fn build(self) -> CandleAggregator {
         let cache = Arc::new(CandleCache::new());
-        let mut flusher = CandleFlusher::new(self.db_pool, cache.clone());
-        flusher.start(self.flush_interval_secs, self.retention_secs);
+        let flusher = CandleFlusher::new(self.db_pool, cache.clone());
+        flusher.start(self.flush_interval_secs, self.retention_secs).await;
 
         CandleAggregator {
             cache,

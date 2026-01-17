@@ -377,6 +377,9 @@ impl RealtimeSyncer {
             "Successfully subscribed - now receiving real-time events"
         );
 
+        // NOTE: We do NOT check for gaps at subscription time because RPC might be delayed.
+        // Instead, we detect gaps on the FIRST WebSocket event (see first_event_gap_checked below).
+
         // Start keepalive task
         let keepalive_write = Arc::new(tokio::sync::Mutex::new(write));
         let keepalive_handle = self.spawn_keepalive(Arc::clone(&keepalive_write));
@@ -390,6 +393,10 @@ impl RealtimeSyncer {
         let mut logs_filtered: u64 = 0;
         let mut messages_total: u64 = 0;
         let mut last_message_time = Instant::now();
+
+        // Flag to track if we've checked for gaps on the first WebSocket event
+        // We detect gaps here (not at subscription time) because RPC might be delayed
+        let mut first_event_gap_checked = false;
 
         info!(
             start_block = self.start_from_block,
@@ -489,6 +496,54 @@ impl RealtimeSyncer {
                                 let logs = mini_block.extract_logs();
                                 logs_extracted += logs.len() as u64;
 
+                                // GAP DETECTION: Check for gaps on first relevant event
+                                // We use the first log's block_number and log_index
+                                if !first_event_gap_checked {
+                                    // Find first relevant log to get its log_index
+                                    if let Some(first_relevant_log) = logs.iter().find(|l| self.is_relevant_log(l)) {
+                                        first_event_gap_checked = true;
+                                        let first_ws_block = block_number;
+                                        let first_ws_log_index = first_relevant_log.log_index.unwrap_or(0);
+
+                                        // Use last_processed_block for reconnection, falls back to start_from_block
+                                        let last_synced = self.last_processed_block.load(Ordering::Relaxed);
+                                        let last_synced = if last_synced > 0 { last_synced } else { self.start_from_block };
+
+                                        if first_ws_block > last_synced {
+                                            let gap_from = last_synced + 1;
+                                            let gap_to = first_ws_block;
+
+                                            info!(
+                                                last_synced = last_synced,
+                                                first_ws_block = first_ws_block,
+                                                first_ws_log_index = first_ws_log_index,
+                                                gap_from = gap_from,
+                                                gap_to = gap_to,
+                                                "Gap detected on first WebSocket event"
+                                            );
+
+                                            // Spawn background task to wait for RPC and fill gap
+                                            self.spawn_wait_and_fill_gap(gap_from, gap_to, first_ws_block, first_ws_log_index);
+                                        } else if first_ws_block == last_synced && first_ws_log_index > 0 {
+                                            // Same block but might have missed earlier logs
+                                            info!(
+                                                last_synced = last_synced,
+                                                first_ws_block = first_ws_block,
+                                                first_ws_log_index = first_ws_log_index,
+                                                "Same block - checking for missed logs before log_index"
+                                            );
+                                            self.spawn_wait_and_fill_gap(first_ws_block, first_ws_block, first_ws_block, first_ws_log_index);
+                                        } else {
+                                            info!(
+                                                last_synced = last_synced,
+                                                first_ws_block = first_ws_block,
+                                                first_ws_log_index = first_ws_log_index,
+                                                "No gap - WebSocket continues from expected block"
+                                            );
+                                        }
+                                    }
+                                }
+
                                 // Filter and process relevant logs
                                 for log in logs {
                                     if !self.is_relevant_log(&log) {
@@ -574,6 +629,51 @@ impl RealtimeSyncer {
                                 }
 
                                 logs_relevant += 1;
+
+                                // GAP DETECTION: Check for gaps on first relevant event
+                                if !first_event_gap_checked {
+                                    first_event_gap_checked = true;
+                                    let first_ws_block = block_number;
+                                    let first_ws_log_index = log_index;
+
+                                    // Use last_processed_block for reconnection, falls back to start_from_block
+                                    let last_synced = self.last_processed_block.load(Ordering::Relaxed);
+                                    let last_synced = if last_synced > 0 { last_synced } else { self.start_from_block };
+
+                                    if first_ws_block > last_synced {
+                                        let gap_from = last_synced + 1;
+                                        let gap_to = first_ws_block;
+
+                                        info!(
+                                            last_synced = last_synced,
+                                            first_ws_block = first_ws_block,
+                                            first_ws_log_index = first_ws_log_index,
+                                            gap_from = gap_from,
+                                            gap_to = gap_to,
+                                            "Gap detected on first WebSocket event (logs mode)"
+                                        );
+
+                                        // Spawn background task to wait for RPC and fill gap
+                                        self.spawn_wait_and_fill_gap(gap_from, gap_to, first_ws_block, first_ws_log_index);
+                                    } else if first_ws_block == last_synced && first_ws_log_index > 0 {
+                                        // Same block but might have missed earlier logs
+                                        info!(
+                                            last_synced = last_synced,
+                                            first_ws_block = first_ws_block,
+                                            first_ws_log_index = first_ws_log_index,
+                                            "Same block - checking for missed logs before log_index (logs mode)"
+                                        );
+                                        self.spawn_wait_and_fill_gap(first_ws_block, first_ws_block, first_ws_block, first_ws_log_index);
+                                    } else {
+                                        info!(
+                                            last_synced = last_synced,
+                                            first_ws_block = first_ws_block,
+                                            first_ws_log_index = first_ws_log_index,
+                                            "No gap - WebSocket continues from expected block (logs mode)"
+                                        );
+                                    }
+                                }
+
                                 let process_start = Instant::now();
 
                                 // Track block number
@@ -817,6 +917,193 @@ impl RealtimeSyncer {
                 }
             }
         })
+    }
+
+    /// Spawn a background task to wait for RPC to catch up, then fill the gap with log_index filtering
+    /// This is used for initial connection and reconnection gap detection
+    fn spawn_wait_and_fill_gap(
+        &self,
+        gap_from: u64,
+        gap_to: u64,
+        first_ws_block: u64,
+        first_ws_log_index: u64,
+    ) {
+        let provider = Arc::clone(&self.provider);
+        let processor = Arc::clone(&self.processor);
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            // Poll RPC until it confirms it has at least gap_to block
+            let poll_interval = Duration::from_millis(100);
+            let max_wait = Duration::from_secs(10);
+            let start = Instant::now();
+
+            loop {
+                match provider.http().get_block_number().await {
+                    Ok(rpc_head) => {
+                        if rpc_head >= gap_to {
+                            info!(
+                                rpc_head = rpc_head,
+                                gap_to = gap_to,
+                                waited_ms = start.elapsed().as_millis(),
+                                "RPC caught up, starting gap fill"
+                            );
+                            break;
+                        }
+                        debug!(
+                            rpc_head = rpc_head,
+                            gap_to = gap_to,
+                            "Waiting for RPC to catch up..."
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "RPC error while waiting for catchup");
+                    }
+                }
+
+                if start.elapsed() > max_wait {
+                    warn!(
+                        waited_ms = start.elapsed().as_millis(),
+                        "RPC catchup timeout, proceeding with gap fill anyway"
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(poll_interval).await;
+            }
+
+            // Now fill the gap with log_index filtering
+            info!(
+                gap_from = gap_from,
+                gap_to = gap_to,
+                first_ws_block = first_ws_block,
+                first_ws_log_index = first_ws_log_index,
+                "Starting gap fill with log_index filtering"
+            );
+
+            let fill_start = Instant::now();
+
+            // Process in batches to avoid overwhelming the RPC
+            let batch_size = 100u64;
+            let mut current = gap_from;
+            let mut total_processed = 0usize;
+            let mut total_skipped = 0usize;
+
+            while current <= gap_to {
+                let batch_end = (current + batch_size - 1).min(gap_to);
+
+                // Phase 1: PoolCreated events (must be first to discover new pools)
+                let pool_filter = Filter::new()
+                    .address(config.pool_manager)
+                    .event_signature(PoolCreated::SIGNATURE_HASH)
+                    .from_block(current)
+                    .to_block(batch_end);
+
+                if let Ok(pool_logs) = provider.http().get_logs(&pool_filter).await {
+                    for log in pool_logs {
+                        let log_block = log.block_number.unwrap_or(0);
+                        let log_idx = log.log_index.unwrap_or(0);
+
+                        // Filter: skip logs from first_ws_block with log_index >= first_ws_log_index
+                        if log_block == first_ws_block && log_idx >= first_ws_log_index {
+                            total_skipped += 1;
+                            continue;
+                        }
+
+                        if let Err(e) = processor.process_log(log).await {
+                            warn!(error = %e, "Failed to process pool log during gap fill");
+                        } else {
+                            total_processed += 1;
+                        }
+                    }
+                }
+
+                // Phase 2: OrderBook events
+                let orderbook_addresses = processor.store().pools.get_all_orderbook_addresses();
+                if !orderbook_addresses.is_empty() {
+                    let orderbook_sigs = vec![
+                        OrderPlaced::SIGNATURE_HASH,
+                        OrderMatched::SIGNATURE_HASH,
+                        UpdateOrder::SIGNATURE_HASH,
+                        OrderCancelled::SIGNATURE_HASH,
+                    ];
+
+                    let orderbook_filter = Filter::new()
+                        .address(orderbook_addresses)
+                        .event_signature(orderbook_sigs)
+                        .from_block(current)
+                        .to_block(batch_end);
+
+                    if let Ok(logs) = provider.http().get_logs(&orderbook_filter).await {
+                        for log in logs {
+                            let log_block = log.block_number.unwrap_or(0);
+                            let log_idx = log.log_index.unwrap_or(0);
+
+                            // Filter: skip logs from first_ws_block with log_index >= first_ws_log_index
+                            if log_block == first_ws_block && log_idx >= first_ws_log_index {
+                                total_skipped += 1;
+                                continue;
+                            }
+
+                            if let Err(e) = processor.process_log(log).await {
+                                warn!(error = %e, "Failed to process orderbook log during gap fill");
+                            } else {
+                                total_processed += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Phase 3: Balance events
+                let balance_sigs = vec![
+                    Deposit::SIGNATURE_HASH,
+                    Withdrawal::SIGNATURE_HASH,
+                    Lock::SIGNATURE_HASH,
+                    Unlock::SIGNATURE_HASH,
+                    TransferFrom::SIGNATURE_HASH,
+                    TransferLockedFrom::SIGNATURE_HASH,
+                ];
+
+                let balance_filter = Filter::new()
+                    .address(config.balance_manager)
+                    .event_signature(balance_sigs)
+                    .from_block(current)
+                    .to_block(batch_end);
+
+                if let Ok(logs) = provider.http().get_logs(&balance_filter).await {
+                    for log in logs {
+                        let log_block = log.block_number.unwrap_or(0);
+                        let log_idx = log.log_index.unwrap_or(0);
+
+                        // Filter: skip logs from first_ws_block with log_index >= first_ws_log_index
+                        if log_block == first_ws_block && log_idx >= first_ws_log_index {
+                            total_skipped += 1;
+                            continue;
+                        }
+
+                        if let Err(e) = processor.process_log(log).await {
+                            warn!(error = %e, "Failed to process balance log during gap fill");
+                        } else {
+                            total_processed += 1;
+                        }
+                    }
+                }
+
+                current = batch_end + 1;
+            }
+
+            let elapsed = fill_start.elapsed();
+            info!(
+                gap_from = gap_from,
+                gap_to = gap_to,
+                first_ws_block = first_ws_block,
+                first_ws_log_index = first_ws_log_index,
+                events_processed = total_processed,
+                events_skipped = total_skipped,
+                elapsed_ms = elapsed.as_millis(),
+                "Gap fill complete"
+            );
+        });
     }
 
     /// Recover missed blocks after reconnection

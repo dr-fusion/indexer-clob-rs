@@ -480,6 +480,10 @@ impl HistoricalSyncer {
             let mut fetched_window: HashMap<usize, (u64, u64, Vec<Log>)> = HashMap::new();
             let mut failed_batches: Vec<(usize, u64, u64)> = Vec::new();
 
+            // Track additional orderbook events to add to subsequent batches
+            // Key: batch_idx, Value: additional logs for new pools discovered in earlier batches
+            let mut additional_logs_for_batch: HashMap<usize, Vec<Log>> = HashMap::new();
+
             for result in fetch_results {
                 match result {
                     Ok((batch_idx, from, to, logs)) => {
@@ -581,17 +585,35 @@ impl HistoricalSyncer {
                     .filter(|addr| !orderbooks_before.contains(addr))
                     .collect();
 
-                // If new pools discovered, fetch their orderbook events for this batch range (1 RPC call)
+                // Process any additional logs from pools discovered in earlier batches
                 let mut additional_events = 0usize;
+                if let Some(earlier_pool_logs) = additional_logs_for_batch.remove(&batch_idx) {
+                    let count = earlier_pool_logs.len();
+                    if count > 0 {
+                        info!(
+                            batch = batch_idx + 1,
+                            events = count,
+                            "Processing additional orderbook events from pools discovered in earlier batches"
+                        );
+                        for log in earlier_pool_logs {
+                            self.processor.process_log(log).await?;
+                        }
+                        additional_events += count;
+                    }
+                }
+
+                // If new pools discovered, fetch their orderbook events for this batch range AND all subsequent batches
                 if !new_orderbooks.is_empty() {
                     info!(
                         batch = batch_idx + 1,
                         new_pools = new_orderbooks.len(),
                         from = from,
                         to = to,
-                        "New pools discovered, fetching orderbook events (1 RPC call)"
+                        remaining_batches = window_end - batch_idx - 1,
+                        "New pools discovered, fetching orderbook events for this and subsequent batches"
                     );
 
+                    // Fetch orderbook events for THIS batch
                     let new_pool_logs = Self::fetch_orderbook_events_for_pools(
                         &self.provider,
                         &new_orderbooks,
@@ -599,9 +621,45 @@ impl HistoricalSyncer {
                         to,
                     ).await?;
 
-                    additional_events = new_pool_logs.len();
+                    additional_events += new_pool_logs.len();
                     for log in new_pool_logs {
                         self.processor.process_log(log).await?;
+                    }
+
+                    // Fetch orderbook events for ALL subsequent batches in this window
+                    // These batches were already fetched without knowing about the new pools
+                    for subsequent_batch_idx in (batch_idx + 1)..window_end {
+                        if let Some((sub_from, sub_to, _)) = fetched_window.get(&subsequent_batch_idx) {
+                            let sub_from = *sub_from;
+                            let sub_to = *sub_to;
+
+                            info!(
+                                batch = subsequent_batch_idx + 1,
+                                from = sub_from,
+                                to = sub_to,
+                                new_pools = new_orderbooks.len(),
+                                "Re-fetching orderbook events for batch that missed new pools"
+                            );
+
+                            let additional_logs = Self::fetch_orderbook_events_for_pools(
+                                &self.provider,
+                                &new_orderbooks,
+                                sub_from,
+                                sub_to,
+                            ).await?;
+
+                            if !additional_logs.is_empty() {
+                                info!(
+                                    batch = subsequent_batch_idx + 1,
+                                    events = additional_logs.len(),
+                                    "Queued additional orderbook events for subsequent batch"
+                                );
+                                additional_logs_for_batch
+                                    .entry(subsequent_batch_idx)
+                                    .or_insert_with(Vec::new)
+                                    .extend(additional_logs);
+                            }
+                        }
                     }
                 }
 

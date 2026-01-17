@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, FixedBytes, B256};
 use indexer_api::{ApiConfig, ApiServer};
-use indexer_candles::CandleAggregatorBuilder;
+use indexer_candles::{CandleAggregator, CandleAggregatorBuilder};
 use indexer_core::{types::Pool, IndexerConfig};
 use indexer_db::{
     repositories::{PoolRepository, SyncStateRepository},
@@ -237,6 +237,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Add Candle sink if database is available
+    // Store aggregator for graceful shutdown
+    let mut candle_aggregator: Option<Arc<CandleAggregator>> = None;
     if let Some(db) = db_pool.clone() {
         let flush_interval = std::env::var("CANDLE_FLUSH_INTERVAL_SECS")
             .ok()
@@ -255,8 +257,9 @@ async fn main() -> anyhow::Result<()> {
             builder = builder.with_publisher(pub_);
         }
 
-        let candle_aggregator = Arc::new(builder.build());
-        let candle_sink = CandleSink::new(candle_aggregator, config.chain_id as i64);
+        let aggregator = Arc::new(builder.build().await);
+        candle_aggregator = Some(aggregator.clone());
+        let candle_sink = CandleSink::new(aggregator, config.chain_id as i64);
         composite_sink.add_sink(Arc::new(candle_sink));
         info!(
             flush_interval_secs = flush_interval,
@@ -371,7 +374,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Close database connections
+    // Stop candle aggregator and wait for final flush (before closing DB pool!)
+    if let Some(aggregator) = candle_aggregator {
+        info!("Stopping candle aggregator...");
+        aggregator.stop().await;
+    }
+
+    // Stop batch writer and wait for final flush (before closing DB pool!)
+    if let Some(writer) = batch_writer {
+        info!("Stopping batch writer...");
+        writer.shutdown().await;
+    }
+
+    // Now close database connections (after all flushes complete)
     if let Some(db) = db_pool {
         db.close().await;
         info!("Database connections closed");

@@ -11,7 +11,7 @@ use crate::repositories::{
 use crate::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info};
 
 /// Types of write operations that can be batched
@@ -29,9 +29,15 @@ pub enum WriteOperation {
     Flush,
 }
 
+/// Internal state for BatchWriter that needs interior mutability
+struct BatchWriterInner {
+    sender: Option<mpsc::Sender<WriteOperation>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Batch writer for efficient database operations
 pub struct BatchWriter {
-    sender: mpsc::Sender<WriteOperation>,
+    inner: Mutex<BatchWriterInner>,
 }
 
 impl BatchWriter {
@@ -50,19 +56,57 @@ impl BatchWriter {
         let (sender, receiver) = mpsc::channel(config.channel_capacity);
 
         // Spawn background writer task
-        tokio::spawn(Self::writer_loop(
+        let handle = tokio::spawn(Self::writer_loop(
             db_pool,
             receiver,
             config.batch_size,
             config.flush_interval_ms,
         ));
 
-        Self { sender }
+        Self {
+            inner: Mutex::new(BatchWriterInner {
+                sender: Some(sender),
+                task_handle: Some(handle),
+            }),
+        }
+    }
+
+    /// Shutdown the writer and wait for the final flush to complete
+    pub async fn shutdown(&self) {
+        let handle = {
+            let mut inner = self.inner.lock().await;
+            // Drop the sender to close the channel, triggering final flush
+            inner.sender.take();
+            // Take the handle to wait on it
+            inner.task_handle.take()
+        };
+
+        // Wait for the writer task to complete (outside the lock)
+        if let Some(handle) = handle {
+            match handle.await {
+                Ok(()) => {
+                    info!("BatchWriter task completed successfully");
+                }
+                Err(e) => {
+                    error!(error = %e, "BatchWriter task panicked");
+                }
+            }
+        }
+    }
+
+    /// Get a clone of the sender for sending operations
+    async fn get_sender(&self) -> Result<mpsc::Sender<WriteOperation>> {
+        let inner = self.inner.lock().await;
+        inner
+            .sender
+            .clone()
+            .ok_or_else(|| crate::DatabaseError::Query("BatchWriter is shutdown".to_string()))
     }
 
     /// Queue a pool for writing
     pub async fn write_pool(&self, pool: DbPool) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Pool(pool))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -71,7 +115,8 @@ impl BatchWriter {
 
     /// Queue an order for writing
     pub async fn write_order(&self, order: DbOrder) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Order(order))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -80,7 +125,8 @@ impl BatchWriter {
 
     /// Queue an order history record
     pub async fn write_order_history(&self, history: DbOrderHistory) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::OrderHistory(history))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -89,7 +135,8 @@ impl BatchWriter {
 
     /// Queue a trade for writing
     pub async fn write_trade(&self, trade: DbTrade) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Trade(trade))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -98,7 +145,8 @@ impl BatchWriter {
 
     /// Queue an orderbook trade for writing
     pub async fn write_orderbook_trade(&self, trade: DbOrderBookTrade) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::OrderBookTrade(trade))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -107,7 +155,8 @@ impl BatchWriter {
 
     /// Queue a balance update
     pub async fn write_balance(&self, balance: DbBalance) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Balance(balance))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -116,7 +165,8 @@ impl BatchWriter {
 
     /// Queue a user for writing
     pub async fn write_user(&self, user: DbUser) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::User(user))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -125,7 +175,8 @@ impl BatchWriter {
 
     /// Queue a currency for writing
     pub async fn write_currency(&self, currency: DbCurrency) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Currency(currency))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -134,7 +185,8 @@ impl BatchWriter {
 
     /// Queue a candle for writing
     pub async fn write_candle(&self, interval: CandleInterval, candle: DbCandle) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Candle(interval, candle))
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -143,7 +195,8 @@ impl BatchWriter {
 
     /// Force flush all pending writes
     pub async fn flush(&self) -> Result<()> {
-        self.sender
+        self.get_sender()
+            .await?
             .send(WriteOperation::Flush)
             .await
             .map_err(|e| crate::DatabaseError::Query(e.to_string()))?;
@@ -530,10 +583,5 @@ impl FlushStats {
     }
 }
 
-impl Clone for BatchWriter {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-        }
-    }
-}
+// Note: BatchWriter should be used with Arc<BatchWriter> for shared ownership
+// Clone is not implemented as the interior Mutex state shouldn't be duplicated

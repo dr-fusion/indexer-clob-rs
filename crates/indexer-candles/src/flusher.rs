@@ -4,15 +4,21 @@ use indexer_db::repositories::CandleRepository;
 use indexer_db::DatabasePool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info};
+
+/// Internal state for CandleFlusher that needs interior mutability
+struct CandleFlusherInner {
+    shutdown_sender: Option<mpsc::Sender<()>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
 
 /// Lazy flusher for candlestick data
 /// Writes buckets to database when they close or on periodic intervals
 pub struct CandleFlusher {
     db_pool: Arc<DatabasePool>,
     cache: Arc<CandleCache>,
-    shutdown_sender: Option<mpsc::Sender<()>>,
+    inner: Mutex<CandleFlusherInner>,
 }
 
 impl CandleFlusher {
@@ -21,31 +27,55 @@ impl CandleFlusher {
         Self {
             db_pool,
             cache,
-            shutdown_sender: None,
+            inner: Mutex::new(CandleFlusherInner {
+                shutdown_sender: None,
+                task_handle: None,
+            }),
         }
     }
 
     /// Start the background flusher task
-    pub fn start(&mut self, flush_interval_secs: u64, retention_secs: u64) {
+    pub async fn start(&self, flush_interval_secs: u64, retention_secs: u64) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        self.shutdown_sender = Some(shutdown_tx);
 
         let db_pool = self.db_pool.clone();
         let cache = self.cache.clone();
 
-        tokio::spawn(Self::flush_loop(
+        let handle = tokio::spawn(Self::flush_loop(
             db_pool,
             cache,
             shutdown_rx,
             flush_interval_secs,
             retention_secs,
         ));
+
+        let mut inner = self.inner.lock().await;
+        inner.shutdown_sender = Some(shutdown_tx);
+        inner.task_handle = Some(handle);
     }
 
-    /// Stop the flusher and flush remaining data
-    pub async fn stop(&mut self) {
-        if let Some(sender) = self.shutdown_sender.take() {
+    /// Stop the flusher and wait for the final flush to complete
+    pub async fn stop(&self) {
+        let (sender, handle) = {
+            let mut inner = self.inner.lock().await;
+            (inner.shutdown_sender.take(), inner.task_handle.take())
+        };
+
+        // Send shutdown signal
+        if let Some(sender) = sender {
             let _ = sender.send(()).await;
+        }
+
+        // Wait for the flush task to complete
+        if let Some(handle) = handle {
+            match handle.await {
+                Ok(()) => {
+                    info!("Candle flusher task completed successfully");
+                }
+                Err(e) => {
+                    error!(error = %e, "Candle flusher task panicked");
+                }
+            }
         }
     }
 
