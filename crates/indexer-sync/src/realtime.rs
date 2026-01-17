@@ -18,61 +18,65 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::provider::ProviderManager;
 
-/// MegaETH miniblock structure (for future WebSocket subscription)
-#[allow(dead_code)]
+/// MegaETH miniblock structure for WebSocket subscription
+/// Fields match the actual miniBlocks WebSocket response (snake_case)
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields are used for deserialization
 pub struct MiniBlock {
-    pub payload_id: String,
-    #[serde(deserialize_with = "deserialize_u64_from_hex")]
+    /// Block number of the EVM block this mini-block belongs to
     pub block_number: u64,
+    /// Block timestamp (seconds)
+    #[serde(default)]
+    pub block_timestamp: u64,
+    /// Index of this mini-block in the EVM block
+    #[serde(default)]
     pub index: u32,
-    pub tx_offset: u32,
-    pub log_offset: u32,
-    pub gas_offset: u64,
-    #[serde(deserialize_with = "deserialize_u64_from_hex")]
+    /// Miniblock number
+    #[serde(default)]
+    pub number: u64,
+    /// Timestamp when mini-block was created (Unix timestamp in milliseconds)
+    #[serde(default)]
     pub timestamp: u64,
+    /// Gas used inside this mini-block
+    #[serde(default)]
     pub gas_used: u64,
+    /// Transactions in this mini-block (stored as raw JSON to avoid type parsing issues)
+    #[serde(default)]
+    pub transactions: Vec<serde_json::Value>,
+    /// Receipts - using custom struct to handle non-standard transaction types
     #[serde(default)]
     pub receipts: Vec<MiniBlockReceipt>,
+    /// Buckets to canonicalize
+    #[serde(default)]
+    pub buckets_to_canonicalize: Vec<serde_json::Value>,
 }
 
-#[allow(dead_code)]
+/// Receipt structure that only extracts what we need (logs)
+/// This avoids issues with non-standard transaction types like 0x7e
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniBlockReceipt {
     #[serde(default)]
-    pub logs: Vec<MiniBlockLog>,
+    pub logs: Vec<alloy::rpc::types::Log>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MiniBlockLog {
-    pub address: alloy::primitives::Address,
-    #[serde(default)]
-    pub topics: Vec<alloy::primitives::B256>,
-    pub data: alloy::primitives::Bytes,
-    #[serde(deserialize_with = "deserialize_u64_from_hex")]
-    pub block_number: u64,
-    pub transaction_hash: alloy::primitives::B256,
-    #[serde(deserialize_with = "deserialize_u64_from_hex")]
-    pub log_index: u64,
-}
+impl MiniBlock {
+    /// Extract all logs from this mini block
+    pub fn extract_logs(&self) -> Vec<alloy::rpc::types::Log> {
+        self.receipts
+            .iter()
+            .flat_map(|receipt| receipt.logs.clone())
+            .collect()
+    }
 
-fn deserialize_u64_from_hex<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(serde::de::Error::custom)
-}
+    /// Get total log count in this mini block
+    pub fn log_count(&self) -> usize {
+        self.receipts.iter().map(|r| r.logs.len()).sum()
+    }
 
-impl From<MiniBlockLog> for alloy::primitives::Log {
-    fn from(log: MiniBlockLog) -> Self {
-        alloy::primitives::Log {
-            address: log.address,
-            data: alloy::primitives::LogData::new(log.topics, log.data).unwrap_or_default(),
-        }
+    /// Get total transaction count in this mini block
+    pub fn tx_count(&self) -> usize {
+        self.receipts.len()
     }
 }
 
@@ -283,10 +287,33 @@ impl RealtimeSyncer {
         }
     }
 
-    /// WebSocket connection and subscription (topic-based, not address-based)
+    /// Identify event type from topic0 signature for logging
+    fn identify_event_type(&self, topic0: Option<alloy::primitives::B256>) -> &'static str {
+        match topic0 {
+            Some(t) if t == OrderPlaced::SIGNATURE_HASH => "OrderPlaced",
+            Some(t) if t == OrderMatched::SIGNATURE_HASH => "OrderMatched",
+            Some(t) if t == UpdateOrder::SIGNATURE_HASH => "UpdateOrder",
+            Some(t) if t == OrderCancelled::SIGNATURE_HASH => "OrderCancelled",
+            Some(t) if t == PoolCreated::SIGNATURE_HASH => "PoolCreated",
+            Some(t) if t == Deposit::SIGNATURE_HASH => "Deposit",
+            Some(t) if t == Withdrawal::SIGNATURE_HASH => "Withdrawal",
+            Some(t) if t == Lock::SIGNATURE_HASH => "Lock",
+            Some(t) if t == Unlock::SIGNATURE_HASH => "Unlock",
+            Some(t) if t == TransferFrom::SIGNATURE_HASH => "TransferFrom",
+            Some(t) if t == TransferLockedFrom::SIGNATURE_HASH => "TransferLockedFrom",
+            _ => "Unknown",
+        }
+    }
+
+    /// WebSocket connection and subscription
+    /// Uses miniBlocks subscription on MegaETH, logs subscription on other chains
     async fn run_websocket_mode(&mut self) -> Result<()> {
         let ws_url = &self.config.ws_url;
-        info!(url = %ws_url, "Connecting to WebSocket for real-time logs subscription");
+        info!(
+            url = %ws_url,
+            miniblocks_enabled = self.config.miniblocks_enabled,
+            "Connecting to WebSocket for real-time sync"
+        );
 
         let (ws_stream, response) = connect_async(ws_url)
             .await
@@ -299,28 +326,42 @@ impl RealtimeSyncer {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe by TOPICS only (not addresses) - this way we get all events
-        // matching our signatures and filter by address client-side.
-        // This ensures we automatically receive events from newly created pools.
-        let topics = self.get_event_topics();
-        info!(
-            topic_count = topics.len(),
-            pool_manager = ?self.config.pool_manager,
-            balance_manager = ?self.config.balance_manager,
-            known_orderbooks = self.processor.store().pools.count(),
-            "Subscribing to logs by event topics (topic-based, not address-based)"
-        );
-
-        let subscribe_msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_subscribe",
-            "params": ["logs", {
-                "topics": [topics],
-                "fromBlock": "pending",
-                "toBlock": "pending"
-            }],
-            "id": 1
-        });
+        // Build subscription message based on mode
+        let subscribe_msg = if self.config.miniblocks_enabled {
+            // MegaETH: Subscribe to miniBlocks stream
+            info!(
+                pool_manager = ?self.config.pool_manager,
+                balance_manager = ?self.config.balance_manager,
+                known_orderbooks = self.processor.store().pools.count(),
+                "Subscribing to miniBlocks stream (MegaETH mode)"
+            );
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_subscribe",
+                "params": ["miniBlocks"],
+                "id": 1
+            })
+        } else {
+            // Standard EVM: Subscribe to logs with topic filtering
+            let topics = self.get_event_topics();
+            info!(
+                topic_count = topics.len(),
+                pool_manager = ?self.config.pool_manager,
+                balance_manager = ?self.config.balance_manager,
+                known_orderbooks = self.processor.store().pools.count(),
+                "Subscribing to logs by event topics (standard EVM mode)"
+            );
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_subscribe",
+                "params": ["logs", {
+                    "topics": [topics],
+                    "fromBlock": "pending",
+                    "toBlock": "pending"
+                }],
+                "id": 1
+            })
+        };
 
         debug!("Sending subscription request");
         write
@@ -332,7 +373,8 @@ impl RealtimeSyncer {
         let subscription_id = self.wait_for_subscription(&mut read).await?;
         info!(
             subscription_id = %subscription_id,
-            "Successfully subscribed to logs - now receiving real-time events"
+            miniblocks_enabled = self.config.miniblocks_enabled,
+            "Successfully subscribed - now receiving real-time events"
         );
 
         // Start keepalive task
@@ -342,14 +384,16 @@ impl RealtimeSyncer {
 
         // Process incoming messages
         let mut last_block_number = self.start_from_block;
-        let mut events_received: u64 = 0;
-        let mut events_processed: u64 = 0;
-        let mut events_filtered: u64 = 0;
+        let mut miniblocks_received: u64 = 0;
+        let mut logs_extracted: u64 = 0;
+        let mut logs_relevant: u64 = 0;
+        let mut logs_filtered: u64 = 0;
         let mut messages_total: u64 = 0;
         let mut last_message_time = Instant::now();
 
         info!(
             start_block = self.start_from_block,
+            miniblocks_enabled = self.config.miniblocks_enabled,
             "Starting to process real-time WebSocket events"
         );
 
@@ -392,130 +436,191 @@ impl RealtimeSyncer {
                         "WebSocket message received"
                     );
 
-                    // Check if it's a log notification
+                    // Check if it's a subscription notification
                     if parsed.get("method") == Some(&serde_json::json!("eth_subscription")) {
                         if let Some(result) = parsed.pointer("/params/result") {
-                            // Capture reception timestamp immediately
                             let received_at = now_micros();
-                            let process_start = Instant::now();
-                            events_received += 1;
 
-                            let log: alloy::rpc::types::Log =
-                                serde_json::from_value(result.clone())
-                                    .map_err(|e| IndexerError::Sync(format!("Log parse: {}", e)))?;
+                            if self.config.miniblocks_enabled {
+                                // ===== MINIBLOCKS MODE (MegaETH) =====
+                                let mini_block: MiniBlock = match serde_json::from_value(result.clone()) {
+                                    Ok(mb) => mb,
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to parse miniBlock, skipping");
+                                        continue;
+                                    }
+                                };
+                                miniblocks_received += 1;
 
-                            let block_number = log.block_number.unwrap_or_default();
-                            let log_index = log.log_index.unwrap_or_default();
-                            let topic0 = log.topics().first().cloned();
+                                let block_number = mini_block.block_number;
+                                let miniblock_index = mini_block.index;
+                                let tx_count = mini_block.tx_count();
+                                let log_count = mini_block.log_count();
 
-                            // Identify event type for logging
-                            let event_type = match topic0 {
-                                Some(t) if t == OrderPlaced::SIGNATURE_HASH => "OrderPlaced",
-                                Some(t) if t == OrderMatched::SIGNATURE_HASH => "OrderMatched",
-                                Some(t) if t == UpdateOrder::SIGNATURE_HASH => "UpdateOrder",
-                                Some(t) if t == OrderCancelled::SIGNATURE_HASH => "OrderCancelled",
-                                Some(t) if t == PoolCreated::SIGNATURE_HASH => "PoolCreated",
-                                Some(t) if t == Deposit::SIGNATURE_HASH => "Deposit",
-                                Some(t) if t == Withdrawal::SIGNATURE_HASH => "Withdrawal",
-                                Some(t) if t == Lock::SIGNATURE_HASH => "Lock",
-                                Some(t) if t == Unlock::SIGNATURE_HASH => "Unlock",
-                                Some(t) if t == TransferFrom::SIGNATURE_HASH => "TransferFrom",
-                                Some(t) if t == TransferLockedFrom::SIGNATURE_HASH => "TransferLockedFrom",
-                                _ => "Unknown",
-                            };
+                                // ALWAYS update block number from every mini block
+                                if block_number > last_block_number {
+                                    last_block_number = block_number;
+                                    self.last_processed_block.store(block_number, Ordering::Relaxed);
 
-                            debug!(
-                                event_type = event_type,
-                                block = block_number,
-                                log_index = log_index,
-                                received_at = received_at,
-                                "Event received from WebSocket"
-                            );
+                                    // Update sync state for every new block
+                                    let mut state = self.processor.store().sync_state.write().await;
+                                    state.set_last_synced_block(block_number);
+                                }
+                                self.last_miniblock_index.store(miniblock_index, Ordering::Relaxed);
 
-                            // CLIENT-SIDE FILTERING: Only process logs from our contracts
-                            if !self.is_relevant_log(&log) {
-                                events_filtered += 1;
-                                debug!(
-                                    event_type = event_type,
-                                    address = ?log.address(),
-                                    block = block_number,
-                                    log_index = log_index,
-                                    events_received = events_received,
-                                    events_filtered = events_filtered,
-                                    "Filtered out irrelevant log (not from our contracts)"
-                                );
-
-                                // Periodic stats even for filtered events
-                                if events_filtered % 100 == 0 {
-                                    info!(
-                                        events_received = events_received,
-                                        events_processed = events_processed,
-                                        events_filtered = events_filtered,
-                                        last_block = last_block_number,
-                                        messages_total = messages_total,
-                                        "Real-time sync stats (filtering active)"
+                                // Log mini block reception (throttled to avoid log spam)
+                                if miniblocks_received % 10 == 1 || log_count > 0 {
+                                    debug!(
+                                        block = block_number,
+                                        miniblock_idx = miniblock_index,
+                                        tx_count = tx_count,
+                                        log_count = log_count,
+                                        miniblocks_received = miniblocks_received,
+                                        "MiniBlock received"
                                     );
                                 }
-                                continue;
-                            }
 
-                            events_processed += 1;
+                                // Skip if no logs to process
+                                if log_count == 0 {
+                                    continue;
+                                }
 
-                            // Track block number for gap detection
-                            if let Some(block_num) = log.block_number {
-                                last_block_number = block_num;
-                                self.last_processed_block.store(block_num, Ordering::Relaxed);
-                            }
+                                // Extract all logs with full metadata
+                                let logs = mini_block.extract_logs();
+                                logs_extracted += logs.len() as u64;
 
-                            // Log the event being processed with timing
-                            debug!(
-                                event_type = event_type,
-                                address = ?log.address(),
-                                block = block_number,
-                                tx_hash = ?log.transaction_hash,
-                                log_index = log_index,
-                                received_at = received_at,
-                                "Processing real-time event"
-                            );
+                                // Filter and process relevant logs
+                                for log in logs {
+                                    if !self.is_relevant_log(&log) {
+                                        logs_filtered += 1;
+                                        continue;
+                                    }
 
-                            // Process the log (this handles PoolCreated to add new orderbooks)
-                            let pipeline_start = Instant::now();
-                            self.processor.process_log(log).await?;
-                            let pipeline_us = pipeline_start.elapsed().as_micros();
-                            let total_us = process_start.elapsed().as_micros();
+                                    logs_relevant += 1;
+                                    let process_start = Instant::now();
 
-                            // Log completion with full timing breakdown
-                            info!(
-                                event_type = event_type,
-                                block = block_number,
-                                log_index = log_index,
-                                received_at = received_at,
-                                pipeline_us = pipeline_us,
-                                total_us = total_us,
-                                "Event processed (WebSocket)"
-                            );
+                                    // Identify event type for logging
+                                    let topic0 = log.topics().first().cloned();
+                                    let event_type = self.identify_event_type(topic0);
 
-                            // Update sync state
-                            if last_block_number > 0 {
-                                let mut state =
-                                    self.processor.store().sync_state.write().await;
-                                state.set_last_synced_block(last_block_number);
-                            }
+                                    info!(
+                                        event_type = event_type,
+                                        block = block_number,
+                                        tx_hash = ?log.transaction_hash,
+                                        log_index = log.log_index,
+                                        "Processing event from miniBlock"
+                                    );
 
-                            // Periodic stats logging
-                            if events_processed % 100 == 0 {
-                                info!(
-                                    received = events_received,
-                                    processed = events_processed,
-                                    filtered = events_filtered,
-                                    last_block = last_block_number,
-                                    messages_total = messages_total,
-                                    "Real-time sync stats"
+                                    // Process through existing pipeline
+                                    self.processor.process_log(log).await?;
+
+                                    let process_us = process_start.elapsed().as_micros();
+                                    debug!(
+                                        event_type = event_type,
+                                        block = block_number,
+                                        process_us = process_us,
+                                        "Event processed (miniBlock)"
+                                    );
+                                }
+
+                                // Periodic stats logging
+                                if miniblocks_received % 100 == 0 {
+                                    info!(
+                                        miniblocks_received = miniblocks_received,
+                                        logs_extracted = logs_extracted,
+                                        logs_relevant = logs_relevant,
+                                        logs_filtered = logs_filtered,
+                                        last_block = last_block_number,
+                                        "MiniBlocks sync stats"
+                                    );
+                                }
+                            } else {
+                                // ===== LOGS MODE (Standard EVM) =====
+                                let log: alloy::rpc::types::Log = match serde_json::from_value(result.clone()) {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to parse log, skipping");
+                                        continue;
+                                    }
+                                };
+                                logs_extracted += 1;
+
+                                let block_number = log.block_number.unwrap_or_default();
+                                let log_index = log.log_index.unwrap_or_default();
+                                let topic0 = log.topics().first().cloned();
+                                let event_type = self.identify_event_type(topic0);
+
+                                debug!(
+                                    event_type = event_type,
+                                    block = block_number,
+                                    log_index = log_index,
+                                    received_at = received_at,
+                                    "Log received from WebSocket"
                                 );
+
+                                // CLIENT-SIDE FILTERING
+                                if !self.is_relevant_log(&log) {
+                                    logs_filtered += 1;
+                                    if logs_filtered % 100 == 0 {
+                                        info!(
+                                            logs_extracted = logs_extracted,
+                                            logs_relevant = logs_relevant,
+                                            logs_filtered = logs_filtered,
+                                            last_block = last_block_number,
+                                            "Real-time sync stats (filtering active)"
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                logs_relevant += 1;
+                                let process_start = Instant::now();
+
+                                // Track block number
+                                if let Some(block_num) = log.block_number {
+                                    last_block_number = block_num;
+                                    self.last_processed_block.store(block_num, Ordering::Relaxed);
+                                }
+
+                                info!(
+                                    event_type = event_type,
+                                    block = block_number,
+                                    tx_hash = ?log.transaction_hash,
+                                    log_index = log_index,
+                                    "Processing event from logs subscription"
+                                );
+
+                                // Process the log
+                                self.processor.process_log(log).await?;
+                                let process_us = process_start.elapsed().as_micros();
+
+                                debug!(
+                                    event_type = event_type,
+                                    block = block_number,
+                                    process_us = process_us,
+                                    "Event processed (logs)"
+                                );
+
+                                // Update sync state
+                                if last_block_number > 0 {
+                                    let mut state = self.processor.store().sync_state.write().await;
+                                    state.set_last_synced_block(last_block_number);
+                                }
+
+                                // Periodic stats logging
+                                if logs_relevant % 100 == 0 {
+                                    info!(
+                                        logs_extracted = logs_extracted,
+                                        logs_relevant = logs_relevant,
+                                        logs_filtered = logs_filtered,
+                                        last_block = last_block_number,
+                                        "Real-time sync stats"
+                                    );
+                                }
                             }
                         }
                     } else {
-                        // Not a subscription message - log what we got
+                        // Not a subscription message
                         debug!(
                             method = method,
                             messages_total = messages_total,
@@ -523,23 +628,22 @@ impl RealtimeSyncer {
                         );
                     }
 
-                    // Periodic heartbeat even when no events (every 1000 messages)
+                    // Periodic heartbeat (every 1000 messages)
                     if messages_total % 1000 == 0 {
                         info!(
                             messages_total = messages_total,
-                            events_received = events_received,
-                            events_processed = events_processed,
-                            events_filtered = events_filtered,
+                            miniblocks_received = miniblocks_received,
+                            logs_relevant = logs_relevant,
                             last_block = last_block_number,
-                            "WebSocket heartbeat - connection alive"
+                            "WebSocket heartbeat"
                         );
                     }
                 }
                 Ok(Message::Close(frame)) => {
                     warn!(
                         frame = ?frame,
-                        events_received = events_received,
-                        events_processed = events_processed,
+                        logs_relevant = logs_relevant,
+                        logs_filtered = logs_filtered,
                         "WebSocket closed by server"
                     );
                     keepalive_handle.abort();
@@ -575,8 +679,8 @@ impl RealtimeSyncer {
                 Err(e) => {
                     error!(
                         error = %e,
-                        events_received = events_received,
-                        events_processed = events_processed,
+                        logs_relevant = logs_relevant,
+                        logs_filtered = logs_filtered,
                         messages_total = messages_total,
                         "WebSocket error"
                     );

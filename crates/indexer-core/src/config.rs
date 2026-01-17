@@ -40,6 +40,8 @@ pub struct IndexerConfig {
     pub stablecoins: HashMap<String, Address>,
     pub fee_receiver: Option<Address>,
     pub sync: SyncConfig,
+    /// Enable miniBlocks subscription (MegaETH-specific)
+    pub miniblocks_enabled: bool,
 }
 
 /// Sync-related configuration
@@ -145,6 +147,11 @@ impl IndexerConfig {
         let env_config = EnvConfig::load()?;
         let deployment = DeploymentConfig::load(env_config.chain_id)?;
 
+        // MiniBlocks subscription (MegaETH-specific, default: false)
+        let miniblocks_enabled = env::var("MINIBLOCKS_ENABLED")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         Ok(Self {
             chain_id: env_config.chain_id,
             rpc_url: env_config.rpc_url,
@@ -155,6 +162,7 @@ impl IndexerConfig {
             stablecoins: deployment.stablecoins,
             fee_receiver: deployment.fee_receiver,
             sync: SyncConfig::default(),
+            miniblocks_enabled,
         })
     }
 }

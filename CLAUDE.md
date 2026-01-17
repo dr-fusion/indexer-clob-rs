@@ -15,8 +15,15 @@ cargo run --release      # Run optimized
 RUST_LOG=info cargo run --release  # Custom log level
 
 # Test
-cargo test               # Run all tests
-cargo test -p indexer-sync  # Run tests for specific crate
+cargo test                          # Run all tests
+cargo test -p indexer-sync          # Run tests for specific crate
+cargo test test_name                # Run single test by name
+cargo test -p indexer-db -- --nocapture  # Run with stdout visible
+
+# Check/Lint
+cargo check              # Fast type checking without full build
+cargo clippy             # Run linter
+cargo fmt                # Format code
 ```
 
 ## Architecture Overview
@@ -84,6 +91,27 @@ Key patterns:
 - **OrderBook**: OrderPlaced, OrderMatched, UpdateOrder, OrderCancelled
 - **BalanceManager**: Deposit, Withdrawal, Lock, Unlock, TransferFrom, TransferLockedFrom
 
-## Dependencies
+## Crate Dependency Order
 
-Key crates: tokio (async runtime), alloy (Ethereum), sqlx (PostgreSQL), async-graphql + axum (API), dashmap (concurrent storage)
+Build dependencies flow in this direction (no cycles):
+```
+indexer-core (foundation - no internal deps)
+    ↓
+indexer-store (depends on core)
+    ↓
+indexer-db, indexer-redis, indexer-candles, indexer-metrics (depend on core)
+    ↓
+indexer-processor (depends on core, store, db, redis, candles)
+    ↓
+indexer-sync (depends on core, store, processor)
+    ↓
+indexer-api (depends on core, store, db)
+```
+
+## Key External Dependencies
+
+- **alloy**: Ethereum RPC/types (replaces ethers-rs)
+- **tokio**: Async runtime
+- **sqlx**: PostgreSQL with compile-time checked queries
+- **async-graphql + axum**: GraphQL API
+- **dashmap**: Lock-free concurrent HashMap
