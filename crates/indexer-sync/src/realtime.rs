@@ -5,12 +5,13 @@ use indexer_core::events::{
     Deposit, Lock, OrderCancelled, OrderMatched, OrderPlaced, PoolCreated, TransferFrom,
     TransferLockedFrom, Unlock, UpdateOrder, Withdrawal,
 };
+use indexer_core::types::now_micros;
 use indexer_core::{IndexerConfig, IndexerError, Result};
 use indexer_processor::EventProcessor;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
@@ -82,13 +83,28 @@ struct ReconnectConfig {
     max_attempts: u32, // 0 = unlimited
 }
 
+impl ReconnectConfig {
+    fn from_env() -> Self {
+        Self {
+            initial_delay_ms: std::env::var("WS_RECONNECT_INITIAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500), // Start with 500ms for faster recovery
+            max_delay_ms: std::env::var("WS_RECONNECT_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15000), // Cap at 15 seconds
+            max_attempts: std::env::var("WS_RECONNECT_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0), // 0 = unlimited
+        }
+    }
+}
+
 impl Default for ReconnectConfig {
     fn default() -> Self {
-        Self {
-            initial_delay_ms: 1000,
-            max_delay_ms: 30000,
-            max_attempts: 0,
-        }
+        Self::from_env()
     }
 }
 
@@ -159,9 +175,22 @@ impl RealtimeSyncer {
         }
 
         let mut reconnect_attempts = 0u32;
-        let config = ReconnectConfig::default();
+        let config = ReconnectConfig::from_env();
+
+        info!(
+            initial_delay_ms = config.initial_delay_ms,
+            max_delay_ms = config.max_delay_ms,
+            max_attempts = config.max_attempts,
+            "WebSocket reconnection config loaded"
+        );
 
         loop {
+            info!(
+                attempt = reconnect_attempts + 1,
+                start_block = self.start_from_block,
+                "Attempting WebSocket connection"
+            );
+
             match self.run_websocket_mode().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -178,14 +207,20 @@ impl RealtimeSyncer {
                         error = %e,
                         attempt = reconnect_attempts + 1,
                         delay_ms = delay.as_millis(),
-                        "WebSocket error, reconnecting with backoff"
+                        "WebSocket disconnected, will reconnect"
                     );
 
                     // Recover any missed blocks during disconnection
+                    info!("Recovering missed blocks before reconnect...");
                     if let Err(gap_err) = self.recover_missed_blocks().await {
                         error!(error = %gap_err, "Failed to recover missed blocks");
                     }
 
+                    info!(
+                        delay_ms = delay.as_millis(),
+                        attempt = reconnect_attempts + 1,
+                        "Waiting before reconnection"
+                    );
                     tokio::time::sleep(delay).await;
                     reconnect_attempts += 1;
                 }
@@ -310,40 +345,117 @@ impl RealtimeSyncer {
         let mut events_received: u64 = 0;
         let mut events_processed: u64 = 0;
         let mut events_filtered: u64 = 0;
+        let mut messages_total: u64 = 0;
+        let mut last_message_time = Instant::now();
 
-        info!("Starting to process real-time WebSocket events");
+        info!(
+            start_block = self.start_from_block,
+            "Starting to process real-time WebSocket events"
+        );
 
         while let Some(msg) = read.next().await {
+            messages_total += 1;
+            let since_last_msg_ms = last_message_time.elapsed().as_millis();
+            last_message_time = Instant::now();
+
             match msg {
                 Ok(Message::Text(text)) => {
+                    // Log raw message length for debugging
+                    trace!(
+                        msg_len = text.len(),
+                        messages_total = messages_total,
+                        since_last_ms = since_last_msg_ms,
+                        "WebSocket text message received"
+                    );
+
                     let parsed: serde_json::Value = serde_json::from_str(&text)
                         .map_err(|e| IndexerError::Sync(format!("JSON parse: {}", e)))?;
 
                     // Check if it's a keepalive response (id >= 1000)
                     if let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) {
                         if id >= 1000 {
-                            trace!(id = id, "Keepalive response received");
+                            debug!(
+                                id = id,
+                                messages_total = messages_total,
+                                "Keepalive response received"
+                            );
                             continue;
                         }
                     }
 
+                    // Log the method for any non-keepalive message
+                    let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    debug!(
+                        method = method,
+                        messages_total = messages_total,
+                        since_last_ms = since_last_msg_ms,
+                        "WebSocket message received"
+                    );
+
                     // Check if it's a log notification
                     if parsed.get("method") == Some(&serde_json::json!("eth_subscription")) {
                         if let Some(result) = parsed.pointer("/params/result") {
+                            // Capture reception timestamp immediately
+                            let received_at = now_micros();
+                            let process_start = Instant::now();
                             events_received += 1;
 
                             let log: alloy::rpc::types::Log =
                                 serde_json::from_value(result.clone())
                                     .map_err(|e| IndexerError::Sync(format!("Log parse: {}", e)))?;
 
+                            let block_number = log.block_number.unwrap_or_default();
+                            let log_index = log.log_index.unwrap_or_default();
+                            let topic0 = log.topics().first().cloned();
+
+                            // Identify event type for logging
+                            let event_type = match topic0 {
+                                Some(t) if t == OrderPlaced::SIGNATURE_HASH => "OrderPlaced",
+                                Some(t) if t == OrderMatched::SIGNATURE_HASH => "OrderMatched",
+                                Some(t) if t == UpdateOrder::SIGNATURE_HASH => "UpdateOrder",
+                                Some(t) if t == OrderCancelled::SIGNATURE_HASH => "OrderCancelled",
+                                Some(t) if t == PoolCreated::SIGNATURE_HASH => "PoolCreated",
+                                Some(t) if t == Deposit::SIGNATURE_HASH => "Deposit",
+                                Some(t) if t == Withdrawal::SIGNATURE_HASH => "Withdrawal",
+                                Some(t) if t == Lock::SIGNATURE_HASH => "Lock",
+                                Some(t) if t == Unlock::SIGNATURE_HASH => "Unlock",
+                                Some(t) if t == TransferFrom::SIGNATURE_HASH => "TransferFrom",
+                                Some(t) if t == TransferLockedFrom::SIGNATURE_HASH => "TransferLockedFrom",
+                                _ => "Unknown",
+                            };
+
+                            debug!(
+                                event_type = event_type,
+                                block = block_number,
+                                log_index = log_index,
+                                received_at = received_at,
+                                "Event received from WebSocket"
+                            );
+
                             // CLIENT-SIDE FILTERING: Only process logs from our contracts
                             if !self.is_relevant_log(&log) {
                                 events_filtered += 1;
-                                trace!(
+                                debug!(
+                                    event_type = event_type,
                                     address = ?log.address(),
-                                    topic0 = ?log.topics().first(),
-                                    "Filtered out irrelevant log"
+                                    block = block_number,
+                                    log_index = log_index,
+                                    events_received = events_received,
+                                    events_filtered = events_filtered,
+                                    "Filtered out irrelevant log (not from our contracts)"
                                 );
+
+                                // Periodic stats even for filtered events
+                                if events_filtered % 100 == 0 {
+                                    info!(
+                                        events_received = events_received,
+                                        events_processed = events_processed,
+                                        events_filtered = events_filtered,
+                                        last_block = last_block_number,
+                                        messages_total = messages_total,
+                                        "Real-time sync stats (filtering active)"
+                                    );
+                                }
                                 continue;
                             }
 
@@ -355,18 +467,33 @@ impl RealtimeSyncer {
                                 self.last_processed_block.store(block_num, Ordering::Relaxed);
                             }
 
-                            // Log the event being processed
+                            // Log the event being processed with timing
                             debug!(
+                                event_type = event_type,
                                 address = ?log.address(),
-                                block = log.block_number,
+                                block = block_number,
                                 tx_hash = ?log.transaction_hash,
-                                log_index = ?log.log_index,
-                                topic0 = ?log.topics().first(),
+                                log_index = log_index,
+                                received_at = received_at,
                                 "Processing real-time event"
                             );
 
                             // Process the log (this handles PoolCreated to add new orderbooks)
+                            let pipeline_start = Instant::now();
                             self.processor.process_log(log).await?;
+                            let pipeline_us = pipeline_start.elapsed().as_micros();
+                            let total_us = process_start.elapsed().as_micros();
+
+                            // Log completion with full timing breakdown
+                            info!(
+                                event_type = event_type,
+                                block = block_number,
+                                log_index = log_index,
+                                received_at = received_at,
+                                pipeline_us = pipeline_us,
+                                total_us = total_us,
+                                "Event processed (WebSocket)"
+                            );
 
                             // Update sync state
                             if last_block_number > 0 {
@@ -382,10 +509,30 @@ impl RealtimeSyncer {
                                     processed = events_processed,
                                     filtered = events_filtered,
                                     last_block = last_block_number,
+                                    messages_total = messages_total,
                                     "Real-time sync stats"
                                 );
                             }
                         }
+                    } else {
+                        // Not a subscription message - log what we got
+                        debug!(
+                            method = method,
+                            messages_total = messages_total,
+                            "Non-subscription message received"
+                        );
+                    }
+
+                    // Periodic heartbeat even when no events (every 1000 messages)
+                    if messages_total % 1000 == 0 {
+                        info!(
+                            messages_total = messages_total,
+                            events_received = events_received,
+                            events_processed = events_processed,
+                            events_filtered = events_filtered,
+                            last_block = last_block_number,
+                            "WebSocket heartbeat - connection alive"
+                        );
                     }
                 }
                 Ok(Message::Close(frame)) => {
@@ -399,21 +546,43 @@ impl RealtimeSyncer {
                     return Err(IndexerError::Sync("WebSocket closed".into()));
                 }
                 Ok(Message::Ping(data)) => {
-                    trace!("Received ping, sending pong");
+                    debug!(
+                        messages_total = messages_total,
+                        "Received ping from server, sending pong"
+                    );
                     let mut write = keepalive_write.lock().await;
                     let _ = write.send(Message::Pong(data)).await;
+                }
+                Ok(Message::Binary(data)) => {
+                    debug!(
+                        len = data.len(),
+                        messages_total = messages_total,
+                        "Received binary message from WebSocket"
+                    );
+                }
+                Ok(Message::Pong(_)) => {
+                    trace!(
+                        messages_total = messages_total,
+                        "Received pong response"
+                    );
+                }
+                Ok(Message::Frame(_)) => {
+                    trace!(
+                        messages_total = messages_total,
+                        "Received raw frame"
+                    );
                 }
                 Err(e) => {
                     error!(
                         error = %e,
                         events_received = events_received,
                         events_processed = events_processed,
+                        messages_total = messages_total,
                         "WebSocket error"
                     );
                     keepalive_handle.abort();
                     return Err(IndexerError::Rpc(format!("WebSocket: {}", e)));
                 }
-                _ => {}
             }
         }
 
@@ -456,7 +625,8 @@ impl RealtimeSyncer {
         }
     }
 
-    /// Spawn keepalive task (sends eth_chainId every 30s to prevent idle timeout)
+    /// Spawn keepalive task that sends both WebSocket Ping frames and eth_chainId
+    /// Ping frames are sent every 10s, eth_chainId every 30s
     fn spawn_keepalive(
         &self,
         write: Arc<
@@ -470,32 +640,76 @@ impl RealtimeSyncer {
             >,
         >,
     ) -> tokio::task::JoinHandle<()> {
-        let keepalive_interval = Duration::from_secs(30);
-        let mut request_id = 1000u64;
+        // WebSocket ping every 10 seconds (more aggressive to prevent drops)
+        let ping_interval_secs = std::env::var("WS_PING_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10u64);
+
+        // eth_chainId every 30 seconds as backup
+        let rpc_interval_secs = std::env::var("WS_RPC_KEEPALIVE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30u64);
+
+        info!(
+            ping_interval_secs = ping_interval_secs,
+            rpc_interval_secs = rpc_interval_secs,
+            "Starting WebSocket keepalive task"
+        );
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(keepalive_interval);
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_interval_secs));
+            let mut rpc_interval = tokio::time::interval(Duration::from_secs(rpc_interval_secs));
+            let mut request_id = 1000u64;
+            let mut ping_count = 0u64;
+
             loop {
-                interval.tick().await;
-                request_id += 1;
+                tokio::select! {
+                    _ = ping_interval.tick() => {
+                        ping_count += 1;
+                        let ping_data = format!("ping-{}", ping_count).into_bytes();
 
-                let msg = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "eth_chainId",
-                    "params": [],
-                    "id": request_id
-                });
+                        debug!(
+                            ping_count = ping_count,
+                            "Sending WebSocket Ping frame"
+                        );
 
-                trace!(request_id = request_id, "Sending keepalive (eth_chainId)");
+                        let mut write = write.lock().await;
+                        if let Err(e) = write.send(Message::Ping(ping_data)).await {
+                            warn!(
+                                error = %e,
+                                ping_count = ping_count,
+                                "WebSocket Ping send failed - connection may be closed"
+                            );
+                            break;
+                        }
+                    }
+                    _ = rpc_interval.tick() => {
+                        request_id += 1;
 
-                let mut write = write.lock().await;
-                if write
-                    .send(Message::Text(msg.to_string()))
-                    .await
-                    .is_err()
-                {
-                    warn!("Keepalive send failed - connection may be closed");
-                    break;
+                        let msg = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "eth_chainId",
+                            "params": [],
+                            "id": request_id
+                        });
+
+                        debug!(
+                            request_id = request_id,
+                            "Sending RPC keepalive (eth_chainId)"
+                        );
+
+                        let mut write = write.lock().await;
+                        if let Err(e) = write.send(Message::Text(msg.to_string())).await {
+                            warn!(
+                                error = %e,
+                                request_id = request_id,
+                                "RPC keepalive send failed - connection may be closed"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         })

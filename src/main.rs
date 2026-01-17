@@ -21,6 +21,41 @@ async fn main() -> anyhow::Result<()> {
     // Load .env file (ignore if not found)
     dotenvy::dotenv().ok();
 
+    // Debug: Print raw env vars before tracing is initialized
+    if let Ok(rpc_url) = std::env::var("RPC_URL") {
+        eprintln!("[DEBUG] Raw RPC_URL from env: '{}'", rpc_url);
+        eprintln!("[DEBUG] RPC_URL length: {}", rpc_url.len());
+
+        // Try to extract host from URL manually
+        // URL format: https://host/path or https://host:port/path
+        if let Some(host_start) = rpc_url.find("://") {
+            let after_scheme = &rpc_url[host_start + 3..];
+            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            let host_with_port = &after_scheme[..host_end];
+            let host = host_with_port.split(':').next().unwrap_or(host_with_port);
+
+            eprintln!("[DEBUG] Extracted host: '{}'", host);
+
+            // Test DNS resolution using std::net (blocking, before tokio runtime)
+            use std::net::ToSocketAddrs;
+            let addr_str = format!("{}:443", host);
+            eprintln!("[DEBUG] Testing DNS for: {}", addr_str);
+            match addr_str.to_socket_addrs() {
+                Ok(addrs) => {
+                    let addrs: Vec<_> = addrs.collect();
+                    eprintln!("[DEBUG] DNS resolution SUCCESS: {:?}", addrs);
+                }
+                Err(e) => {
+                    eprintln!("[DEBUG] DNS resolution FAILED: {}", e);
+                    eprintln!("[DEBUG] Try running: ping {}", host);
+                    eprintln!("[DEBUG] Try running: nslookup {}", host);
+                }
+            }
+        }
+    } else {
+        eprintln!("[DEBUG] RPC_URL not found in environment!");
+    }
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

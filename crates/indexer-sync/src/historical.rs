@@ -5,6 +5,7 @@ use indexer_core::events::{
     Deposit, Lock, OrderCancelled, OrderMatched, OrderPlaced, PoolCreated, TransferFrom,
     TransferLockedFrom, Unlock, UpdateOrder, Withdrawal,
 };
+use indexer_core::types::now_micros;
 use indexer_core::{IndexerConfig, IndexerError, Result};
 use indexer_processor::EventProcessor;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,100 @@ use crate::adaptive_batch::{
     AdaptiveConcurrencyController, BlockRangeTracker,
 };
 use crate::provider::ProviderManager;
+
+/// Tracks event counts per type for logging
+#[derive(Default)]
+struct EventCounts {
+    pool_created: usize,
+    order_placed: usize,
+    order_matched: usize,
+    update_order: usize,
+    order_cancelled: usize,
+    deposit: usize,
+    withdrawal: usize,
+    lock: usize,
+    unlock: usize,
+    transfer_from: usize,
+    transfer_locked_from: usize,
+}
+
+impl EventCounts {
+    /// Count events by topic0 (event signature) from a list of logs
+    fn from_logs(logs: &[Log]) -> Self {
+        let mut counts = Self::default();
+        for log in logs {
+            if let Some(topic0) = log.topics().first() {
+                if *topic0 == PoolCreated::SIGNATURE_HASH {
+                    counts.pool_created += 1;
+                } else if *topic0 == OrderPlaced::SIGNATURE_HASH {
+                    counts.order_placed += 1;
+                } else if *topic0 == OrderMatched::SIGNATURE_HASH {
+                    counts.order_matched += 1;
+                } else if *topic0 == UpdateOrder::SIGNATURE_HASH {
+                    counts.update_order += 1;
+                } else if *topic0 == OrderCancelled::SIGNATURE_HASH {
+                    counts.order_cancelled += 1;
+                } else if *topic0 == Deposit::SIGNATURE_HASH {
+                    counts.deposit += 1;
+                } else if *topic0 == Withdrawal::SIGNATURE_HASH {
+                    counts.withdrawal += 1;
+                } else if *topic0 == Lock::SIGNATURE_HASH {
+                    counts.lock += 1;
+                } else if *topic0 == Unlock::SIGNATURE_HASH {
+                    counts.unlock += 1;
+                } else if *topic0 == TransferFrom::SIGNATURE_HASH {
+                    counts.transfer_from += 1;
+                } else if *topic0 == TransferLockedFrom::SIGNATURE_HASH {
+                    counts.transfer_locked_from += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// Returns a compact summary string of non-zero event counts
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.pool_created > 0 {
+            parts.push(format!("pools:{}", self.pool_created));
+        }
+        if self.order_placed > 0 {
+            parts.push(format!("placed:{}", self.order_placed));
+        }
+        if self.order_matched > 0 {
+            parts.push(format!("matched:{}", self.order_matched));
+        }
+        if self.update_order > 0 {
+            parts.push(format!("updated:{}", self.update_order));
+        }
+        if self.order_cancelled > 0 {
+            parts.push(format!("cancelled:{}", self.order_cancelled));
+        }
+        if self.deposit > 0 {
+            parts.push(format!("deposits:{}", self.deposit));
+        }
+        if self.withdrawal > 0 {
+            parts.push(format!("withdrawals:{}", self.withdrawal));
+        }
+        if self.lock > 0 {
+            parts.push(format!("locks:{}", self.lock));
+        }
+        if self.unlock > 0 {
+            parts.push(format!("unlocks:{}", self.unlock));
+        }
+        if self.transfer_from > 0 {
+            parts.push(format!("transfers:{}", self.transfer_from));
+        }
+        if self.transfer_locked_from > 0 {
+            parts.push(format!("locked_transfers:{}", self.transfer_locked_from));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
 
 /// Historical sync implementation using eth_getLogs with adaptive batch sizing and concurrency
 pub struct HistoricalSyncer {
@@ -209,16 +304,14 @@ impl HistoricalSyncer {
             // Get current concurrency (may change based on AIMD)
             let concurrency = self.concurrency_controller.get();
             let window_end = (window_start + concurrency).min(total_batches);
-            let window_size = window_end - window_start;
+            let _window_size = window_end - window_start;
 
-            debug!(
-                window_start = window_start + 1,
-                window_end = window_end,
-                window_size = window_size,
-                total = total_batches,
+            info!(
+                window = format!("{}-{}/{}", window_start + 1, window_end, total_batches),
                 concurrency = concurrency,
+                batch_size = self.batch_controller.get_size(),
                 known_orderbooks = known_orderbooks_before.len(),
-                "Starting window"
+                "Starting fetch window"
             );
 
             // Fetch all batches in this window in parallel
@@ -253,104 +346,129 @@ impl HistoricalSyncer {
                             return Err((batch_idx, from, to, IndexerError::Sync("Shutdown requested".to_string())));
                         }
 
-                        let fetch_start = std::time::Instant::now();
-
-                        // Fetch ALL events in parallel (PoolCreated + OrderBook + Balance = 11 calls)
-                        let (
-                            pool_created,
-                            order_placed,
-                            order_matched,
-                            update_order,
-                            order_cancelled,
-                            deposit,
-                            withdrawal,
-                            lock,
-                            unlock,
-                            transfer_from,
-                            transfer_locked_from,
-                        ) = tokio::join!(
-                            Self::fetch_single_event(&provider, config.pool_manager, PoolCreated::SIGNATURE_HASH, from, to, "PoolCreated"),
-                            Self::fetch_single_event_multi_address(&provider, &orderbook_addresses, OrderPlaced::SIGNATURE_HASH, from, to, "OrderPlaced"),
-                            Self::fetch_single_event_multi_address(&provider, &orderbook_addresses, OrderMatched::SIGNATURE_HASH, from, to, "OrderMatched"),
-                            Self::fetch_single_event_multi_address(&provider, &orderbook_addresses, UpdateOrder::SIGNATURE_HASH, from, to, "UpdateOrder"),
-                            Self::fetch_single_event_multi_address(&provider, &orderbook_addresses, OrderCancelled::SIGNATURE_HASH, from, to, "OrderCancelled"),
-                            Self::fetch_single_event(&provider, config.balance_manager, Deposit::SIGNATURE_HASH, from, to, "Deposit"),
-                            Self::fetch_single_event(&provider, config.balance_manager, Withdrawal::SIGNATURE_HASH, from, to, "Withdrawal"),
-                            Self::fetch_single_event(&provider, config.balance_manager, Lock::SIGNATURE_HASH, from, to, "Lock"),
-                            Self::fetch_single_event(&provider, config.balance_manager, Unlock::SIGNATURE_HASH, from, to, "Unlock"),
-                            Self::fetch_single_event(&provider, config.balance_manager, TransferFrom::SIGNATURE_HASH, from, to, "TransferFrom"),
-                            Self::fetch_single_event(&provider, config.balance_manager, TransferLockedFrom::SIGNATURE_HASH, from, to, "TransferLockedFrom"),
-                        );
-
-                        // Collect results, propagating first error
-                        let mut all_logs: Vec<Log> = Vec::new();
-
-                        match (pool_created, order_placed, order_matched, update_order, order_cancelled,
-                               deposit, withdrawal, lock, unlock, transfer_from, transfer_locked_from) {
-                            (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(g), Ok(h), Ok(i), Ok(j), Ok(k)) => {
-                                all_logs.extend(a);
-                                all_logs.extend(b);
-                                all_logs.extend(c);
-                                all_logs.extend(d);
-                                all_logs.extend(e);
-                                all_logs.extend(f);
-                                all_logs.extend(g);
-                                all_logs.extend(h);
-                                all_logs.extend(i);
-                                all_logs.extend(j);
-                                all_logs.extend(k);
-                            }
-                            (Err(e), _, _, _, _, _, _, _, _, _, _) |
-                            (_, Err(e), _, _, _, _, _, _, _, _, _) |
-                            (_, _, Err(e), _, _, _, _, _, _, _, _) |
-                            (_, _, _, Err(e), _, _, _, _, _, _, _) |
-                            (_, _, _, _, Err(e), _, _, _, _, _, _) |
-                            (_, _, _, _, _, Err(e), _, _, _, _, _) |
-                            (_, _, _, _, _, _, Err(e), _, _, _, _) |
-                            (_, _, _, _, _, _, _, Err(e), _, _, _) |
-                            (_, _, _, _, _, _, _, _, Err(e), _, _) |
-                            (_, _, _, _, _, _, _, _, _, Err(e), _) |
-                            (_, _, _, _, _, _, _, _, _, _, Err(e)) => {
-                                let err_msg = e.to_string().to_lowercase();
-                                if Self::is_too_many_logs_error(&err_msg) {
-                                    warn!(from = from, to = to, error = %e, "Too many logs - reducing batch size");
-                                    batch_controller.report_error();
-                                } else if Self::is_rate_limit_error(&err_msg) {
-                                    warn!(from = from, to = to, error = %e, "Rate limit - reducing concurrency");
-                                    concurrency_controller.report_error();
-                                } else if Self::is_connection_error(&err_msg) {
-                                    warn!(from = from, to = to, error = %e, "Connection error - reducing concurrency");
-                                    concurrency_controller.report_error();
-                                } else {
-                                    error!(from = from, to = to, error = %e, "Unknown fetch error");
-                                }
-                                return Err((batch_idx, from, to, e));
-                            }
-                        }
-
-                        // Sort by (block_number, log_index)
-                        all_logs.sort_by(|a, b| {
-                            let block_a = a.block_number.unwrap_or(0);
-                            let block_b = b.block_number.unwrap_or(0);
-                            let log_idx_a = a.log_index.unwrap_or(0);
-                            let log_idx_b = b.log_index.unwrap_or(0);
-                            (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
-                        });
-
-                        batch_controller.report_success();
-                        concurrency_controller.report_success();
-
-                        debug!(
+                        info!(
                             batch = batch_idx + 1,
                             total = total,
-                            from = from,
-                            to = to,
-                            events = all_logs.len(),
-                            fetch_ms = fetch_start.elapsed().as_millis(),
-                            "Fetched batch"
+                            blocks = format!("{}-{}", from, to),
+                            block_count = to - from + 1,
+                            orderbooks = orderbook_addresses.len(),
+                            "Fetching batch (1 RPC call)"
                         );
 
-                        Ok((batch_idx, from, to, all_logs))
+                        let fetch_start = std::time::Instant::now();
+
+                        // Combine all addresses: PoolManager + BalanceManager + OrderBooks
+                        let mut all_addresses = vec![config.pool_manager, config.balance_manager];
+                        all_addresses.extend(orderbook_addresses.iter().cloned());
+
+                        // Combine all 11 event signatures
+                        let all_topics = vec![
+                            PoolCreated::SIGNATURE_HASH,
+                            OrderPlaced::SIGNATURE_HASH,
+                            OrderMatched::SIGNATURE_HASH,
+                            UpdateOrder::SIGNATURE_HASH,
+                            OrderCancelled::SIGNATURE_HASH,
+                            Deposit::SIGNATURE_HASH,
+                            Withdrawal::SIGNATURE_HASH,
+                            Lock::SIGNATURE_HASH,
+                            Unlock::SIGNATURE_HASH,
+                            TransferFrom::SIGNATURE_HASH,
+                            TransferLockedFrom::SIGNATURE_HASH,
+                        ];
+
+                        let filter = Filter::new()
+                            .address(all_addresses)
+                            .event_signature(all_topics)
+                            .from_block(from)
+                            .to_block(to);
+
+                        let result = provider.http().get_logs(&filter).await;
+                        let fetch_ms = fetch_start.elapsed().as_millis();
+
+                        match result {
+                            Ok(mut all_logs) => {
+                                // Sort by (block_number, log_index)
+                                all_logs.sort_by(|a, b| {
+                                    let block_a = a.block_number.unwrap_or(0);
+                                    let block_b = b.block_number.unwrap_or(0);
+                                    let log_idx_a = a.log_index.unwrap_or(0);
+                                    let log_idx_b = b.log_index.unwrap_or(0);
+                                    (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
+                                });
+
+                                // Count events by type for logging
+                                let event_counts = EventCounts::from_logs(&all_logs);
+
+                                batch_controller.report_success();
+                                concurrency_controller.report_success();
+
+                                let total_events = all_logs.len();
+
+                                // Log at INFO level with event breakdown
+                                info!(
+                                    batch = batch_idx + 1,
+                                    total = total,
+                                    blocks = format!("{}-{}", from, to),
+                                    fetch_ms = fetch_ms,
+                                    events = total_events,
+                                    breakdown = %event_counts.summary(),
+                                    "Batch fetched"
+                                );
+
+                                Ok((batch_idx, from, to, all_logs))
+                            }
+                            Err(e) => {
+                                let err = IndexerError::Rpc(format!("{:?}", e));
+                                let err_msg = err.to_string().to_lowercase();
+
+                                if Self::is_too_many_logs_error(&err_msg) {
+                                    warn!(
+                                        batch = batch_idx,
+                                        from = from,
+                                        to = to,
+                                        blocks = to - from + 1,
+                                        fetch_ms = fetch_ms,
+                                        error = %err,
+                                        "Too many logs - reducing batch size"
+                                    );
+                                    batch_controller.report_error();
+                                } else if Self::is_rate_limit_error(&err_msg) {
+                                    warn!(
+                                        batch = batch_idx,
+                                        from = from,
+                                        to = to,
+                                        blocks = to - from + 1,
+                                        fetch_ms = fetch_ms,
+                                        error = %err,
+                                        "Rate limit - reducing concurrency"
+                                    );
+                                    concurrency_controller.report_error();
+                                } else if Self::is_connection_error(&err_msg) {
+                                    warn!(
+                                        batch = batch_idx,
+                                        from = from,
+                                        to = to,
+                                        blocks = to - from + 1,
+                                        fetch_ms = fetch_ms,
+                                        error = %err,
+                                        "Connection error - reducing concurrency"
+                                    );
+                                    concurrency_controller.report_error();
+                                } else {
+                                    error!(
+                                        batch = batch_idx,
+                                        from = from,
+                                        to = to,
+                                        blocks = to - from + 1,
+                                        fetch_ms = fetch_ms,
+                                        error = %err,
+                                        error_debug = ?e,
+                                        "Unknown fetch error"
+                                    );
+                                }
+                                Err((batch_idx, from, to, err))
+                            }
+                        }
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -369,10 +487,25 @@ impl HistoricalSyncer {
                     }
                     Err((batch_idx, from, to, e)) => {
                         if Self::is_retryable_error(&e) {
-                            warn!(batch = batch_idx + 1, from = from, to = to, "Batch fetch failed, will retry immediately");
+                            warn!(
+                                batch = batch_idx + 1,
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                error = %e,
+                                "Batch fetch failed (retryable), will retry immediately"
+                            );
                             failed_batches.push((batch_idx, from, to));
                         } else {
-                            error!(batch = batch_idx + 1, from = from, to = to, error = %e, "Non-retryable fetch error");
+                            error!(
+                                batch = batch_idx + 1,
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                error = %e,
+                                error_debug = ?e,
+                                "Non-retryable fetch error - see error_debug for full details"
+                            );
                             return Err(e);
                         }
                     }
@@ -404,9 +537,41 @@ impl HistoricalSyncer {
                 let orderbooks_before: Vec<alloy::primitives::Address> =
                     self.processor.store().pools.get_all_orderbook_addresses();
 
-                // Process all logs for this batch
+                // Process all logs for this batch with detailed timing
+                let batch_received_at = now_micros();
                 for log in &logs {
+                    let log_start = std::time::Instant::now();
+                    let block_num = log.block_number.unwrap_or_default();
+                    let log_idx = log.log_index.unwrap_or_default();
+                    let topic0 = log.topics().first().cloned();
+
+                    // Identify event type for logging
+                    let event_type = match topic0 {
+                        Some(t) if t == OrderPlaced::SIGNATURE_HASH => "OrderPlaced",
+                        Some(t) if t == OrderMatched::SIGNATURE_HASH => "OrderMatched",
+                        Some(t) if t == UpdateOrder::SIGNATURE_HASH => "UpdateOrder",
+                        Some(t) if t == OrderCancelled::SIGNATURE_HASH => "OrderCancelled",
+                        Some(t) if t == PoolCreated::SIGNATURE_HASH => "PoolCreated",
+                        Some(t) if t == Deposit::SIGNATURE_HASH => "Deposit",
+                        Some(t) if t == Withdrawal::SIGNATURE_HASH => "Withdrawal",
+                        Some(t) if t == Lock::SIGNATURE_HASH => "Lock",
+                        Some(t) if t == Unlock::SIGNATURE_HASH => "Unlock",
+                        Some(t) if t == TransferFrom::SIGNATURE_HASH => "TransferFrom",
+                        Some(t) if t == TransferLockedFrom::SIGNATURE_HASH => "TransferLockedFrom",
+                        _ => "Unknown",
+                    };
+
                     self.processor.process_log(log.clone()).await?;
+                    let log_us = log_start.elapsed().as_micros();
+
+                    debug!(
+                        event_type = event_type,
+                        block = block_num,
+                        log_index = log_idx,
+                        batch_received_at = batch_received_at,
+                        process_us = log_us,
+                        "Event processed (historical batch)"
+                    );
                 }
 
                 // Check if new pools were discovered in this batch
@@ -416,44 +581,27 @@ impl HistoricalSyncer {
                     .filter(|addr| !orderbooks_before.contains(addr))
                     .collect();
 
-                // If new pools discovered, fetch their orderbook events for this batch range
+                // If new pools discovered, fetch their orderbook events for this batch range (1 RPC call)
                 let mut additional_events = 0usize;
                 if !new_orderbooks.is_empty() {
-                    debug!(
+                    info!(
                         batch = batch_idx + 1,
                         new_pools = new_orderbooks.len(),
                         from = from,
                         to = to,
-                        "New pools discovered, fetching their orderbook events"
+                        "New pools discovered, fetching orderbook events (1 RPC call)"
                     );
 
-                    let (order_placed, order_matched, update_order, order_cancelled) = tokio::join!(
-                        Self::fetch_single_event_multi_address(&self.provider, &new_orderbooks, OrderPlaced::SIGNATURE_HASH, from, to, "OrderPlaced"),
-                        Self::fetch_single_event_multi_address(&self.provider, &new_orderbooks, OrderMatched::SIGNATURE_HASH, from, to, "OrderMatched"),
-                        Self::fetch_single_event_multi_address(&self.provider, &new_orderbooks, UpdateOrder::SIGNATURE_HASH, from, to, "UpdateOrder"),
-                        Self::fetch_single_event_multi_address(&self.provider, &new_orderbooks, OrderCancelled::SIGNATURE_HASH, from, to, "OrderCancelled"),
-                    );
+                    let new_pool_logs = Self::fetch_orderbook_events_for_pools(
+                        &self.provider,
+                        &new_orderbooks,
+                        from,
+                        to,
+                    ).await?;
 
-                    let mut new_pool_logs: Vec<Log> = Vec::new();
-                    new_pool_logs.extend(order_placed?);
-                    new_pool_logs.extend(order_matched?);
-                    new_pool_logs.extend(update_order?);
-                    new_pool_logs.extend(order_cancelled?);
-
-                    if !new_pool_logs.is_empty() {
-                        // Sort and process
-                        new_pool_logs.sort_by(|a, b| {
-                            let block_a = a.block_number.unwrap_or(0);
-                            let block_b = b.block_number.unwrap_or(0);
-                            let log_idx_a = a.log_index.unwrap_or(0);
-                            let log_idx_b = b.log_index.unwrap_or(0);
-                            (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
-                        });
-
-                        additional_events = new_pool_logs.len();
-                        for log in new_pool_logs {
-                            self.processor.process_log(log).await?;
-                        }
+                    additional_events = new_pool_logs.len();
+                    for log in new_pool_logs {
+                        self.processor.process_log(log).await?;
                     }
                 }
 
@@ -519,6 +667,7 @@ impl HistoricalSyncer {
     }
 
     /// Retry fetching a batch with exponential backoff
+    /// For "too many logs" errors, splits the range in half and fetches recursively
     /// Returns the fetched logs on success
     async fn retry_fetch_with_backoff(
         &self,
@@ -526,72 +675,120 @@ impl HistoricalSyncer {
         to: u64,
         max_retries: u32,
     ) -> Result<Vec<Log>> {
-        let mut attempts = 0u32;
-        let mut delay = Duration::from_millis(self.config.sync.retry_delay_ms);
-        let max_delay = Duration::from_secs(30);
+        // Use the recursive implementation that handles range splitting
+        self.fetch_with_split(from, to, max_retries, 0).await
+    }
 
-        loop {
-            attempts += 1;
+    /// Recursive fetch that splits range on "too many logs" errors
+    fn fetch_with_split<'a>(
+        &'a self,
+        from: u64,
+        to: u64,
+        max_retries: u32,
+        depth: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Log>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut attempts = 0u32;
+            let mut delay = Duration::from_millis(self.config.sync.retry_delay_ms);
+            let max_delay = Duration::from_secs(30);
+            let max_depth = 10; // Prevent infinite recursion
 
-            // Get current orderbooks for this retry
-            let orderbook_addresses = self.processor.store().pools.get_all_orderbook_addresses();
+            loop {
+                attempts += 1;
 
-            // Try to fetch all events
-            let result = Self::fetch_all_events_parallel(
-                &self.provider,
-                &self.config,
-                &orderbook_addresses,
-                from,
-                to,
-            )
-            .await;
+                // Get current orderbooks for this retry
+                let orderbook_addresses = self.processor.store().pools.get_all_orderbook_addresses();
 
-            match result {
-                Ok(logs) => {
-                    if attempts > 1 {
-                        info!(from = from, to = to, attempts = attempts, "Batch fetch succeeded after retry");
+                // Try to fetch all events
+                let result = Self::fetch_all_events_parallel(
+                    &self.provider,
+                    &self.config,
+                    &orderbook_addresses,
+                    from,
+                    to,
+                )
+                .await;
+
+                match result {
+                    Ok(logs) => {
+                        if attempts > 1 || depth > 0 {
+                            info!(from = from, to = to, blocks = to - from + 1, attempts = attempts, depth = depth, "Batch fetch succeeded");
+                        }
+                        self.batch_controller.report_success();
+                        self.concurrency_controller.report_success();
+                        return Ok(logs);
                     }
-                    self.batch_controller.report_success();
-                    self.concurrency_controller.report_success();
-                    return Ok(logs);
-                }
-                Err(e) if attempts < max_retries && Self::is_retryable_error(&e) => {
-                    let err_msg = e.to_string().to_lowercase();
+                    Err(e) => {
+                        let err_msg = e.to_string().to_lowercase();
+                        let is_too_many = Self::is_too_many_logs_error(&err_msg);
 
-                    // Adjust AIMD controllers based on error type
-                    if Self::is_too_many_logs_error(&err_msg) {
-                        self.batch_controller.report_error();
-                    } else if Self::is_rate_limit_error(&err_msg) || Self::is_connection_error(&err_msg) {
-                        self.concurrency_controller.report_error();
+                        // For "too many logs" errors, split the range and fetch recursively
+                        if is_too_many && from < to && depth < max_depth {
+                            self.batch_controller.report_error();
+
+                            let mid = from + (to - from) / 2;
+                            warn!(
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                split_at = mid,
+                                depth = depth,
+                                "Too many logs - splitting range in half"
+                            );
+
+                            // Fetch first half
+                            let mut logs = self.fetch_with_split(from, mid, max_retries, depth + 1).await?;
+
+                            // Fetch second half
+                            let logs2 = self.fetch_with_split(mid + 1, to, max_retries, depth + 1).await?;
+
+                            // Combine and sort by (block_number, log_index)
+                            logs.extend(logs2);
+                            logs.sort_by(|a, b| {
+                                let block_a = a.block_number.unwrap_or(0);
+                                let block_b = b.block_number.unwrap_or(0);
+                                let idx_a = a.log_index.unwrap_or(0);
+                                let idx_b = b.log_index.unwrap_or(0);
+                                (block_a, idx_a).cmp(&(block_b, idx_b))
+                            });
+
+                            return Ok(logs);
+                        }
+
+                        // For other retryable errors, use exponential backoff
+                        if attempts < max_retries && Self::is_retryable_error(&e) {
+                            if Self::is_rate_limit_error(&err_msg) || Self::is_connection_error(&err_msg) {
+                                self.concurrency_controller.report_error();
+                            }
+
+                            let actual_delay = if Self::is_rate_limit_error(&err_msg) {
+                                let retry_secs = Self::parse_retry_seconds(&err_msg).unwrap_or(10);
+                                Duration::from_secs(retry_secs)
+                            } else {
+                                delay
+                            };
+
+                            warn!(
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                attempt = attempts,
+                                max_retries = max_retries,
+                                delay_ms = actual_delay.as_millis(),
+                                error = %e,
+                                "Batch fetch failed, retrying with backoff"
+                            );
+
+                            tokio::time::sleep(actual_delay).await;
+                            delay = (delay * 2).min(max_delay);
+                        } else {
+                            error!(from = from, to = to, blocks = to - from + 1, attempts = attempts, error = %e, "Batch fetch failed after max retries");
+                            return Err(e);
+                        }
                     }
-
-                    // For rate limits, try to parse the retry time
-                    let actual_delay = if Self::is_rate_limit_error(&err_msg) {
-                        let retry_secs = Self::parse_retry_seconds(&err_msg).unwrap_or(10);
-                        Duration::from_secs(retry_secs)
-                    } else {
-                        delay
-                    };
-
-                    warn!(
-                        from = from,
-                        to = to,
-                        attempt = attempts,
-                        max_retries = max_retries,
-                        delay_ms = actual_delay.as_millis(),
-                        error = %e,
-                        "Batch fetch failed, retrying with backoff"
-                    );
-
-                    tokio::time::sleep(actual_delay).await;
-                    delay = (delay * 2).min(max_delay); // Exponential backoff capped at max
-                }
-                Err(e) => {
-                    error!(from = from, to = to, attempts = attempts, error = %e, "Batch fetch failed after max retries");
-                    return Err(e);
                 }
             }
-        }
+        })
     }
 
     /// Process a batch with retry logic - splits batch on "too many logs" errors
@@ -738,7 +935,14 @@ impl HistoricalSyncer {
 
     /// Check if error message indicates "too many logs" (need smaller batch size)
     fn is_too_many_logs_error(msg: &str) -> bool {
-        msg.contains("too many logs") || msg.contains("-32005")
+        // Error messages
+        msg.contains("too many logs")
+            || msg.contains("exceeds max results")
+            || msg.contains("query returned more than")
+            || msg.contains("log response size exceeded")
+            // Error codes
+            || msg.contains("-32005")
+            || msg.contains("-32602")
     }
 
     /// Check if error message indicates rate limiting (need lower concurrency)
@@ -790,6 +994,16 @@ impl HistoricalSyncer {
             || msg.contains("dns")
             || msg.contains("resolve")
             || msg.contains("unreachable")
+            // hyper/reqwest specific errors
+            || msg.contains("incompletemessage")
+            || msg.contains("incomplete message")
+            || msg.contains("sendrequest")
+            || msg.contains("send request")
+            || msg.contains("hyper")
+            || msg.contains("reqwest")
+            || msg.contains("transport")
+            || msg.contains("closed")
+            || msg.contains("aborted")
     }
 
     /// Check if an error is retryable (RPC rate limits, timeouts, too many logs, etc.)
@@ -852,8 +1066,40 @@ impl HistoricalSyncer {
 
         // Process all events in order (already sorted by block_number, log_index)
         let process_start = Instant::now();
+        let batch_received_at = now_micros();
         for log in &all_logs {
+            let log_start = Instant::now();
+            let block_num = log.block_number.unwrap_or_default();
+            let log_idx = log.log_index.unwrap_or_default();
+            let topic0 = log.topics().first().cloned();
+
+            // Identify event type for logging
+            let event_type = match topic0 {
+                Some(t) if t == OrderPlaced::SIGNATURE_HASH => "OrderPlaced",
+                Some(t) if t == OrderMatched::SIGNATURE_HASH => "OrderMatched",
+                Some(t) if t == UpdateOrder::SIGNATURE_HASH => "UpdateOrder",
+                Some(t) if t == OrderCancelled::SIGNATURE_HASH => "OrderCancelled",
+                Some(t) if t == PoolCreated::SIGNATURE_HASH => "PoolCreated",
+                Some(t) if t == Deposit::SIGNATURE_HASH => "Deposit",
+                Some(t) if t == Withdrawal::SIGNATURE_HASH => "Withdrawal",
+                Some(t) if t == Lock::SIGNATURE_HASH => "Lock",
+                Some(t) if t == Unlock::SIGNATURE_HASH => "Unlock",
+                Some(t) if t == TransferFrom::SIGNATURE_HASH => "TransferFrom",
+                Some(t) if t == TransferLockedFrom::SIGNATURE_HASH => "TransferLockedFrom",
+                _ => "Unknown",
+            };
+
             processor.process_log(log.clone()).await?;
+            let log_us = log_start.elapsed().as_micros();
+
+            debug!(
+                event_type = event_type,
+                block = block_num,
+                log_index = log_idx,
+                batch_received_at = batch_received_at,
+                process_us = log_us,
+                "Event processed (historical static)"
+            );
         }
         let process_ms = process_start.elapsed().as_millis();
 
@@ -870,66 +1116,23 @@ impl HistoricalSyncer {
                 from = from_block,
                 to = to_block,
                 new_pools = new_pools.len(),
-                "Discovered new pools, re-fetching orderbook events"
+                "Discovered new pools, re-fetching orderbook events (1 RPC call)"
             );
 
-            // Re-fetch orderbook events for newly discovered pools (4 parallel calls)
-            let (order_placed, order_matched, update_order, order_cancelled) = tokio::join!(
-                Self::fetch_single_event_multi_address(
-                    provider,
-                    &new_pools,
-                    OrderPlaced::SIGNATURE_HASH,
-                    from_block,
-                    to_block,
-                    "OrderPlaced"
-                ),
-                Self::fetch_single_event_multi_address(
-                    provider,
-                    &new_pools,
-                    OrderMatched::SIGNATURE_HASH,
-                    from_block,
-                    to_block,
-                    "OrderMatched"
-                ),
-                Self::fetch_single_event_multi_address(
-                    provider,
-                    &new_pools,
-                    UpdateOrder::SIGNATURE_HASH,
-                    from_block,
-                    to_block,
-                    "UpdateOrder"
-                ),
-                Self::fetch_single_event_multi_address(
-                    provider,
-                    &new_pools,
-                    OrderCancelled::SIGNATURE_HASH,
-                    from_block,
-                    to_block,
-                    "OrderCancelled"
-                ),
-            );
-
-            let mut additional_logs: Vec<Log> = Vec::new();
-            additional_logs.extend(order_placed?);
-            additional_logs.extend(order_matched?);
-            additional_logs.extend(update_order?);
-            additional_logs.extend(order_cancelled?);
+            // Re-fetch orderbook events for newly discovered pools (1 RPC call with 4 topics)
+            let additional_logs = Self::fetch_orderbook_events_for_pools(
+                provider,
+                &new_pools,
+                from_block,
+                to_block,
+            ).await?;
 
             additional_events = additional_logs.len();
-            if !additional_logs.is_empty() {
-                // Sort by (block_number, log_index)
-                additional_logs.sort_by(|a, b| {
-                    let block_a = a.block_number.unwrap_or(0);
-                    let block_b = b.block_number.unwrap_or(0);
-                    let log_idx_a = a.log_index.unwrap_or(0);
-                    let log_idx_b = b.log_index.unwrap_or(0);
-                    (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
-                });
+            for log in additional_logs {
+                processor.process_log(log).await?;
+            }
 
-                for log in additional_logs {
-                    processor.process_log(log).await?;
-                }
-
+            if additional_events > 0 {
                 info!(
                     from = from_block,
                     to = to_block,
@@ -963,87 +1166,34 @@ impl HistoricalSyncer {
         Ok(())
     }
 
-    /// Fetch a single event type from a contract
-    async fn fetch_single_event(
-        provider: &ProviderManager,
-        address: alloy::primitives::Address,
-        event_sig: alloy::primitives::FixedBytes<32>,
-        from_block: u64,
-        to_block: u64,
-        event_name: &str,
-    ) -> Result<Vec<Log>> {
-        let filter = Filter::new()
-            .address(address)
-            .event_signature(event_sig)
-            .from_block(from_block)
-            .to_block(to_block);
-
-        let logs = provider
-            .http()
-            .get_logs(&filter)
-            .await
-            .map_err(|e| {
-                // Use Debug format to get full error chain including response details
-                IndexerError::Rpc(format!("{:?}", e))
-            })?;
-
-        if !logs.is_empty() {
-            debug!(
-                event = event_name,
-                address = ?address,
-                from = from_block,
-                to = to_block,
-                count = logs.len(),
-                "Fetched event logs"
-            );
-        }
-
-        Ok(logs)
-    }
-
-    /// Fetch a single event type from multiple contracts (e.g., orderbooks)
-    async fn fetch_single_event_multi_address(
-        provider: &ProviderManager,
+    /// Build JSON-RPC request body for logging
+    fn build_eth_get_logs_request_body(
         addresses: &[alloy::primitives::Address],
-        event_sig: alloy::primitives::FixedBytes<32>,
+        topics: &[alloy::primitives::FixedBytes<32>],
         from_block: u64,
         to_block: u64,
-        event_name: &str,
-    ) -> Result<Vec<Log>> {
-        if addresses.is_empty() {
-            return Ok(vec![]);
-        }
+    ) -> String {
+        let addresses_json: Vec<String> = addresses.iter().map(|a| format!("{:?}", a)).collect();
+        let topics_json: Vec<String> = topics.iter().map(|t| format!("{:?}", t)).collect();
 
-        let filter = Filter::new()
-            .address(addresses.to_vec())
-            .event_signature(event_sig)
-            .from_block(from_block)
-            .to_block(to_block);
-
-        let logs = provider
-            .http()
-            .get_logs(&filter)
-            .await
-            .map_err(|e| {
-                // Use Debug format to get full error chain including response details
-                IndexerError::Rpc(format!("{:?}", e))
-            })?;
-
-        if !logs.is_empty() {
-            debug!(
-                event = event_name,
-                addresses = addresses.len(),
-                from = from_block,
-                to = to_block,
-                count = logs.len(),
-                "Fetched event logs (multi-address)"
-            );
-        }
-
-        Ok(logs)
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getLogs",
+            "params": [{
+                "address": if addresses_json.len() == 1 {
+                    serde_json::Value::String(addresses_json[0].clone())
+                } else {
+                    serde_json::Value::Array(addresses_json.into_iter().map(serde_json::Value::String).collect())
+                },
+                "topics": [topics_json],
+                "fromBlock": format!("0x{:x}", from_block),
+                "toBlock": format!("0x{:x}", to_block)
+            }],
+            "id": 1
+        }).to_string()
     }
 
-    /// Fetch all events in parallel - one RPC call per event type
+    /// Fetch all events with a single RPC call using combined addresses and topics
     async fn fetch_all_events_parallel(
         provider: &ProviderManager,
         config: &IndexerConfig,
@@ -1051,136 +1201,167 @@ impl HistoricalSyncer {
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<Log>> {
-        // Launch all event fetches in parallel
-        let (
-            pool_created,
-            order_placed,
-            order_matched,
-            update_order,
-            order_cancelled,
-            deposit,
-            withdrawal,
-            lock,
-            unlock,
-            transfer_from,
-            transfer_locked_from,
-        ) = tokio::join!(
-            // PoolManager events
-            Self::fetch_single_event(
-                provider,
-                config.pool_manager,
-                PoolCreated::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "PoolCreated"
-            ),
-            // OrderBook events (all orderbooks)
-            Self::fetch_single_event_multi_address(
-                provider,
-                orderbook_addresses,
-                OrderPlaced::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "OrderPlaced"
-            ),
-            Self::fetch_single_event_multi_address(
-                provider,
-                orderbook_addresses,
-                OrderMatched::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "OrderMatched"
-            ),
-            Self::fetch_single_event_multi_address(
-                provider,
-                orderbook_addresses,
-                UpdateOrder::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "UpdateOrder"
-            ),
-            Self::fetch_single_event_multi_address(
-                provider,
-                orderbook_addresses,
-                OrderCancelled::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "OrderCancelled"
-            ),
-            // BalanceManager events
-            Self::fetch_single_event(
-                provider,
-                config.balance_manager,
-                Deposit::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "Deposit"
-            ),
-            Self::fetch_single_event(
-                provider,
-                config.balance_manager,
-                Withdrawal::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "Withdrawal"
-            ),
-            Self::fetch_single_event(
-                provider,
-                config.balance_manager,
-                Lock::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "Lock"
-            ),
-            Self::fetch_single_event(
-                provider,
-                config.balance_manager,
-                Unlock::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "Unlock"
-            ),
-            Self::fetch_single_event(
-                provider,
-                config.balance_manager,
-                TransferFrom::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "TransferFrom"
-            ),
-            Self::fetch_single_event(
-                provider,
-                config.balance_manager,
-                TransferLockedFrom::SIGNATURE_HASH,
-                from_block,
-                to_block,
-                "TransferLockedFrom"
-            ),
+        // Combine all addresses: PoolManager + BalanceManager + all OrderBooks
+        let mut all_addresses = vec![config.pool_manager, config.balance_manager];
+        all_addresses.extend_from_slice(orderbook_addresses);
+
+        // Combine all 11 event signatures
+        let all_topics = vec![
+            PoolCreated::SIGNATURE_HASH,
+            OrderPlaced::SIGNATURE_HASH,
+            OrderMatched::SIGNATURE_HASH,
+            UpdateOrder::SIGNATURE_HASH,
+            OrderCancelled::SIGNATURE_HASH,
+            Deposit::SIGNATURE_HASH,
+            Withdrawal::SIGNATURE_HASH,
+            Lock::SIGNATURE_HASH,
+            Unlock::SIGNATURE_HASH,
+            TransferFrom::SIGNATURE_HASH,
+            TransferLockedFrom::SIGNATURE_HASH,
+        ];
+
+        let filter = Filter::new()
+            .address(all_addresses.clone())
+            .event_signature(all_topics.clone())
+            .from_block(from_block)
+            .to_block(to_block);
+
+        // Build request body for logging
+        let request_body = Self::build_eth_get_logs_request_body(
+            &all_addresses,
+            &all_topics,
+            from_block,
+            to_block,
         );
 
-        // Collect all results, propagating errors
-        let mut all_logs: Vec<Log> = Vec::new();
-        all_logs.extend(pool_created?);
-        all_logs.extend(order_placed?);
-        all_logs.extend(order_matched?);
-        all_logs.extend(update_order?);
-        all_logs.extend(order_cancelled?);
-        all_logs.extend(deposit?);
-        all_logs.extend(withdrawal?);
-        all_logs.extend(lock?);
-        all_logs.extend(unlock?);
-        all_logs.extend(transfer_from?);
-        all_logs.extend(transfer_locked_from?);
+        debug!(
+            from = from_block,
+            to = to_block,
+            blocks = to_block - from_block + 1,
+            addresses = all_addresses.len(),
+            topics = all_topics.len(),
+            request_body = %request_body,
+            "RPC Request: eth_getLogs (combined)"
+        );
 
-        // Sort by (block_number, log_index) to ensure proper ordering
-        all_logs.sort_by(|a, b| {
-            let block_a = a.block_number.unwrap_or(0);
-            let block_b = b.block_number.unwrap_or(0);
-            let log_idx_a = a.log_index.unwrap_or(0);
-            let log_idx_b = b.log_index.unwrap_or(0);
-            (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
-        });
+        let request_start = std::time::Instant::now();
+        let result = provider.http().get_logs(&filter).await;
+        let request_ms = request_start.elapsed().as_millis();
 
-        Ok(all_logs)
+        match result {
+            Ok(mut logs) => {
+                debug!(
+                    from = from_block,
+                    to = to_block,
+                    count = logs.len(),
+                    request_ms = request_ms,
+                    "RPC Response: eth_getLogs (combined) success"
+                );
+
+                // Sort by (block_number, log_index) to ensure proper ordering
+                logs.sort_by(|a, b| {
+                    let block_a = a.block_number.unwrap_or(0);
+                    let block_b = b.block_number.unwrap_or(0);
+                    let log_idx_a = a.log_index.unwrap_or(0);
+                    let log_idx_b = b.log_index.unwrap_or(0);
+                    (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
+                });
+
+                Ok(logs)
+            }
+            Err(e) => {
+                error!(
+                    from = from_block,
+                    to = to_block,
+                    blocks = to_block - from_block + 1,
+                    request_ms = request_ms,
+                    request_body = %request_body,
+                    error = %e,
+                    error_debug = ?e,
+                    "RPC Error: eth_getLogs (combined) failed"
+                );
+                Err(IndexerError::Rpc(format!("{:?}", e)))
+            }
+        }
+    }
+
+    /// Fetch orderbook events for newly discovered pools with a single RPC call
+    async fn fetch_orderbook_events_for_pools(
+        provider: &ProviderManager,
+        orderbook_addresses: &[alloy::primitives::Address],
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Log>> {
+        if orderbook_addresses.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 4 orderbook event signatures
+        let orderbook_topics = vec![
+            OrderPlaced::SIGNATURE_HASH,
+            OrderMatched::SIGNATURE_HASH,
+            UpdateOrder::SIGNATURE_HASH,
+            OrderCancelled::SIGNATURE_HASH,
+        ];
+
+        let filter = Filter::new()
+            .address(orderbook_addresses.to_vec())
+            .event_signature(orderbook_topics.clone())
+            .from_block(from_block)
+            .to_block(to_block);
+
+        let request_body = Self::build_eth_get_logs_request_body(
+            orderbook_addresses,
+            &orderbook_topics,
+            from_block,
+            to_block,
+        );
+
+        debug!(
+            from = from_block,
+            to = to_block,
+            addresses = orderbook_addresses.len(),
+            request_body = %request_body,
+            "RPC Request: eth_getLogs (new pools orderbook events)"
+        );
+
+        let request_start = std::time::Instant::now();
+        let result = provider.http().get_logs(&filter).await;
+        let request_ms = request_start.elapsed().as_millis();
+
+        match result {
+            Ok(mut logs) => {
+                debug!(
+                    from = from_block,
+                    to = to_block,
+                    count = logs.len(),
+                    request_ms = request_ms,
+                    "RPC Response: eth_getLogs (new pools) success"
+                );
+
+                // Sort by (block_number, log_index)
+                logs.sort_by(|a, b| {
+                    let block_a = a.block_number.unwrap_or(0);
+                    let block_b = b.block_number.unwrap_or(0);
+                    let log_idx_a = a.log_index.unwrap_or(0);
+                    let log_idx_b = b.log_index.unwrap_or(0);
+                    (block_a, log_idx_a).cmp(&(block_b, log_idx_b))
+                });
+
+                Ok(logs)
+            }
+            Err(e) => {
+                error!(
+                    from = from_block,
+                    to = to_block,
+                    request_ms = request_ms,
+                    request_body = %request_body,
+                    error = %e,
+                    error_debug = ?e,
+                    "RPC Error: eth_getLogs (new pools) failed"
+                );
+                Err(IndexerError::Rpc(format!("{:?}", e)))
+            }
+        }
     }
 }

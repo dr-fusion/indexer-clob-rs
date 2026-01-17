@@ -12,7 +12,7 @@ use crate::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Types of write operations that can be batched
 #[derive(Debug)]
@@ -319,29 +319,50 @@ impl BatchWriter {
 
         // Flush pools (bulk) - deduplicate by id
         if !pools.is_empty() {
+            let pool_start = Instant::now();
             let deduped = Self::dedup_by_key(pools, |p| p.id.clone());
             stats.pools = deduped.len();
             match PoolRepository::bulk_upsert(pool, &deduped).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.pools,
+                        duration_ms = pool_start.elapsed().as_millis(),
+                        "DB: Bulk upserted pools"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.pools, "Failed to bulk upsert pools"),
             }
         }
 
         // Flush orders (bulk) - deduplicate by order_id
         if !orders.is_empty() {
+            let order_start = Instant::now();
             let deduped = Self::dedup_by_key(orders, |o| o.order_id.clone());
             stats.orders = deduped.len();
             match OrderRepository::bulk_upsert(pool, &deduped).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.orders,
+                        duration_ms = order_start.elapsed().as_millis(),
+                        "DB: Bulk upserted orders"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.orders, "Failed to bulk upsert orders"),
             }
         }
 
         // Flush order histories (bulk) - no dedup needed, each is unique
         if !order_histories.is_empty() {
+            let history_start = Instant::now();
             stats.order_histories = order_histories.len();
             match OrderRepository::bulk_insert_history(pool, order_histories).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.order_histories,
+                        duration_ms = history_start.elapsed().as_millis(),
+                        "DB: Bulk inserted order histories"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.order_histories, "Failed to bulk insert order histories"),
             }
             order_histories.clear();
@@ -349,9 +370,16 @@ impl BatchWriter {
 
         // Flush trades (bulk) - no dedup needed, each trade is unique
         if !trades.is_empty() {
+            let trade_start = Instant::now();
             stats.trades = trades.len();
             match TradeRepository::bulk_insert(pool, trades).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.trades,
+                        duration_ms = trade_start.elapsed().as_millis(),
+                        "DB: Bulk inserted trades"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.trades, "Failed to bulk insert trades"),
             }
             trades.clear();
@@ -359,9 +387,16 @@ impl BatchWriter {
 
         // Flush orderbook trades (bulk) - no dedup needed
         if !ob_trades.is_empty() {
+            let ob_start = Instant::now();
             stats.ob_trades = ob_trades.len();
             match TradeRepository::bulk_insert_orderbook_trades(pool, ob_trades).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.ob_trades,
+                        duration_ms = ob_start.elapsed().as_millis(),
+                        "DB: Bulk inserted orderbook trades"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.ob_trades, "Failed to bulk insert orderbook trades"),
             }
             ob_trades.clear();
@@ -369,36 +404,58 @@ impl BatchWriter {
 
         // Flush balances (bulk) - deduplicate by id
         if !balances.is_empty() {
+            let balance_start = Instant::now();
             let deduped = Self::dedup_by_key(balances, |b| b.id.clone());
             stats.balances = deduped.len();
             match BalanceRepository::bulk_upsert(pool, &deduped).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.balances,
+                        duration_ms = balance_start.elapsed().as_millis(),
+                        "DB: Bulk upserted balances"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.balances, "Failed to bulk upsert balances"),
             }
         }
 
         // Flush users (bulk) - deduplicate by user
         if !users.is_empty() {
+            let user_start = Instant::now();
             let deduped = Self::dedup_by_key(users, |u| u.user.clone());
             stats.users = deduped.len();
             match UserRepository::bulk_insert_ignore(pool, &deduped).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.users,
+                        duration_ms = user_start.elapsed().as_millis(),
+                        "DB: Bulk inserted users"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.users, "Failed to bulk insert users"),
             }
         }
 
         // Flush currencies (bulk) - deduplicate by (chain_id, address)
         if !currencies.is_empty() {
+            let currency_start = Instant::now();
             let deduped = Self::dedup_by_key(currencies, |c| (c.chain_id, c.address.clone()));
             stats.currencies = deduped.len();
             match UserRepository::bulk_upsert_currencies(pool, &deduped).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    debug!(
+                        count = stats.currencies,
+                        duration_ms = currency_start.elapsed().as_millis(),
+                        "DB: Bulk upserted currencies"
+                    );
+                }
                 Err(e) => error!(error = %e, count = stats.currencies, "Failed to bulk upsert currencies"),
             }
         }
 
         // Flush candles by interval (batch per interval) - deduplicate by (interval, pool_id, open_time)
         if !candles.is_empty() {
+            let candle_start = Instant::now();
             let deduped = Self::dedup_by_key(candles, |(interval, c)| {
                 (*interval, c.pool_id.clone(), c.open_time)
             });
@@ -408,11 +465,24 @@ impl BatchWriter {
                 by_interval.entry(interval).or_default().push(candle);
             }
             for (interval, interval_candles) in by_interval {
+                let interval_start = Instant::now();
                 match CandleRepository::batch_upsert(pool, interval, &interval_candles).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        debug!(
+                            interval = ?interval,
+                            count = interval_candles.len(),
+                            duration_ms = interval_start.elapsed().as_millis(),
+                            "DB: Batch upserted candles"
+                        );
+                    }
                     Err(e) => error!(error = %e, interval = ?interval, "Failed to batch upsert candles"),
                 }
             }
+            debug!(
+                total_candles = stats.candles,
+                duration_ms = candle_start.elapsed().as_millis(),
+                "DB: All candles flushed"
+            );
         }
 
         let elapsed_ms = flush_start.elapsed().as_millis();

@@ -3,8 +3,9 @@ use crate::messages::StreamMessage;
 use crate::{RedisError, Result};
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Redis stream publisher with async fire-and-forget support and batch publishing
 pub struct RedisPublisher {
@@ -45,17 +46,31 @@ impl RedisPublisher {
 
     /// Publish a message to a channel (goes to stream)
     pub async fn publish<T: Serialize>(&self, channel: String, data: T) -> Result<()> {
+        let start = Instant::now();
+        let channel_name = channel.clone();
         let message = StreamMessage::new(channel, data)?;
 
         if let Some(sender) = &self.async_sender {
             // Fire and forget mode
             if sender.try_send(message).is_err() {
-                warn!("Redis publish queue full, dropping message");
+                warn!(channel = %channel_name, "Redis publish queue full, dropping message");
+            } else {
+                trace!(
+                    channel = %channel_name,
+                    queue_us = start.elapsed().as_micros(),
+                    "Message queued for Redis async publish"
+                );
             }
             Ok(())
         } else {
             // Synchronous mode
-            self.publish_sync(message).await
+            let result = self.publish_sync(message).await;
+            debug!(
+                channel = %channel_name,
+                publish_us = start.elapsed().as_micros(),
+                "Message published to Redis (sync)"
+            );
+            result
         }
     }
 
@@ -105,6 +120,15 @@ impl RedisPublisher {
         let stream_key = connection.config().stream_key.clone();
         let max_len = connection.config().max_len;
         let mut batch: Vec<StreamMessage> = Vec::with_capacity(batch_size);
+        let mut total_published: u64 = 0;
+        let mut total_batches: u64 = 0;
+
+        info!(
+            stream_key = %stream_key,
+            batch_size = batch_size,
+            max_len = max_len,
+            "Redis async publisher loop started"
+        );
 
         loop {
             // Try to fill batch without blocking
@@ -113,7 +137,14 @@ impl RedisPublisher {
             // Wait for first message
             match receiver.recv().await {
                 Some(msg) => batch.push(msg),
-                None => break, // Channel closed
+                None => {
+                    info!(
+                        total_published = total_published,
+                        total_batches = total_batches,
+                        "Redis async publisher loop ended - channel closed"
+                    );
+                    break;
+                }
             }
 
             // Collect more messages if available (non-blocking)
@@ -126,6 +157,8 @@ impl RedisPublisher {
 
             // Publish batch using pipeline
             if !batch.is_empty() {
+                let batch_start = Instant::now();
+                let current_batch_size = batch.len();
                 let mut conn = connection.get_connection();
                 let mut pipe = redis::pipe();
 
@@ -150,10 +183,25 @@ impl RedisPublisher {
                 let result: std::result::Result<(), redis::RedisError> =
                     pipe.query_async(&mut conn).await;
 
+                let batch_duration_us = batch_start.elapsed().as_micros();
+
                 if let Err(e) = result {
-                    error!(error = %e, batch_size = batch.len(), "Failed to publish batch to Redis");
+                    error!(
+                        error = %e,
+                        batch_size = current_batch_size,
+                        duration_us = batch_duration_us,
+                        "Failed to publish batch to Redis"
+                    );
                 } else {
-                    debug!(batch_size = batch.len(), "Published batch to Redis");
+                    total_published += current_batch_size as u64;
+                    total_batches += 1;
+                    debug!(
+                        batch_size = current_batch_size,
+                        duration_us = batch_duration_us,
+                        total_published = total_published,
+                        total_batches = total_batches,
+                        "Published batch to Redis"
+                    );
                 }
             }
         }

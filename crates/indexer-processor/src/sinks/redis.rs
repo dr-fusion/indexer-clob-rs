@@ -8,6 +8,7 @@ use indexer_redis::channels::{
 use indexer_redis::messages::{BalanceMessage, OrderMessage, TradeMessage};
 use indexer_redis::RedisPublisher;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 /// Redis sink for real-time event streaming
@@ -33,6 +34,7 @@ impl EventSink for RedisSink {
             SinkEvent::OrderPlaced(e)
             | SinkEvent::OrderUpdated(e)
             | SinkEvent::OrderCancelled(e) => {
+                let redis_start = Instant::now();
                 let event_type = match e.event_type {
                     super::traits::OrderEventType::Placed => "placed",
                     super::traits::OrderEventType::Updated => "updated",
@@ -40,6 +42,14 @@ impl EventSink for RedisSink {
                     super::traits::OrderEventType::Filled => "filled",
                     super::traits::OrderEventType::PartiallyFilled => "partially_filled",
                 };
+
+                debug!(
+                    order_id = e.order_id,
+                    block = e.block_number,
+                    log_index = e.log_index,
+                    event_type = event_type,
+                    "Publishing order to Redis"
+                );
 
                 let msg = OrderMessage {
                     event_type: event_type.to_string(),
@@ -56,25 +66,54 @@ impl EventSink for RedisSink {
                 };
 
                 // Publish to orderbook channel
+                let channel_start = Instant::now();
                 let channel = orderbook_channel(&e.pool_id);
-                if let Err(err) = self.publisher.publish_order(channel, &msg).await {
+                if let Err(err) = self.publisher.publish_order(channel.clone(), &msg).await {
                     tracing::error!(error = %err, "Failed to publish order to Redis");
                 }
+                let orderbook_us = channel_start.elapsed().as_micros();
 
                 // Publish to user's orders channel
+                let user_channel_start = Instant::now();
                 let user_channel = user_orders_channel(&e.user);
-                if let Err(err) = self.publisher.publish_order(user_channel, &msg).await {
+                if let Err(err) = self.publisher.publish_order(user_channel.clone(), &msg).await {
                     tracing::error!(error = %err, "Failed to publish to user orders channel");
                 }
+                let user_channel_us = user_channel_start.elapsed().as_micros();
 
                 // Publish to user's pool-specific orders channel
+                let pool_channel_start = Instant::now();
                 let user_pool_channel = user_orders_pool_channel(&e.user, &e.pool_id);
-                if let Err(err) = self.publisher.publish_order(user_pool_channel, &msg).await {
+                if let Err(err) = self.publisher.publish_order(user_pool_channel.clone(), &msg).await {
                     tracing::error!(error = %err, "Failed to publish to user pool orders channel");
                 }
+                let pool_channel_us = pool_channel_start.elapsed().as_micros();
+
+                let total_redis_us = redis_start.elapsed().as_micros();
+                debug!(
+                    order_id = e.order_id,
+                    block = e.block_number,
+                    log_index = e.log_index,
+                    event_type = event_type,
+                    orderbook_us = orderbook_us,
+                    user_channel_us = user_channel_us,
+                    pool_channel_us = pool_channel_us,
+                    total_redis_us = total_redis_us,
+                    "Order published to Redis"
+                );
             }
 
             SinkEvent::OrderMatched(e) => {
+                let redis_start = Instant::now();
+
+                debug!(
+                    buy_order = e.buy_order_id,
+                    sell_order = e.sell_order_id,
+                    block = e.block_number,
+                    log_index = e.log_index,
+                    "Publishing trade to Redis"
+                );
+
                 let msg = TradeMessage {
                     pool_id: e.pool_id.clone(),
                     price: e.execution_price,
@@ -89,16 +128,32 @@ impl EventSink for RedisSink {
                 };
 
                 // Publish to trades channel
+                let trades_start = Instant::now();
                 let channel = trades_channel(&e.pool_id);
-                if let Err(err) = self.publisher.publish_trade(channel, &msg).await {
+                if let Err(err) = self.publisher.publish_trade(channel.clone(), &msg).await {
                     tracing::error!(error = %err, "Failed to publish trade to Redis");
                 }
+                let trades_us = trades_start.elapsed().as_micros();
 
                 // Publish to user's trades channel
+                let user_start = Instant::now();
                 let user_channel = user_trades_pool_channel(&e.taker_address, &e.pool_id);
-                if let Err(err) = self.publisher.publish_trade(user_channel, &msg).await {
+                if let Err(err) = self.publisher.publish_trade(user_channel.clone(), &msg).await {
                     tracing::error!(error = %err, "Failed to publish to user trades channel");
                 }
+                let user_us = user_start.elapsed().as_micros();
+
+                let total_redis_us = redis_start.elapsed().as_micros();
+                debug!(
+                    buy_order = e.buy_order_id,
+                    sell_order = e.sell_order_id,
+                    block = e.block_number,
+                    log_index = e.log_index,
+                    trades_channel_us = trades_us,
+                    user_channel_us = user_us,
+                    total_redis_us = total_redis_us,
+                    "Trade published to Redis"
+                );
             }
 
             SinkEvent::BalanceChanged(e) => {

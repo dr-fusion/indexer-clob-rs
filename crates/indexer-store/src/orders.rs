@@ -3,6 +3,8 @@ use dashmap::DashMap;
 use indexer_core::types::{Order, OrderKey, OrderSide};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
+use tracing::debug;
 
 /// Thread-safe store for orders with multiple indexes
 #[derive(Debug)]
@@ -48,18 +50,29 @@ impl OrderStore {
 
     /// Insert a new order
     pub fn insert(&self, order: Order) {
+        let start = Instant::now();
+        let order_id = order.order_id;
+        let pool_id = order.pool_id;
+        let is_active = order.is_active();
+        let price = order.price;
+        let side = order.side;
+        let user = order.user;
+
         let key = OrderKey {
             pool_id: order.pool_id,
             order_id: order.order_id,
         };
 
         // Update user index
+        let user_index_start = Instant::now();
         self.user_orders
             .entry(order.user)
             .or_insert_with(HashSet::new)
             .insert(key);
+        let user_index_us = user_index_start.elapsed().as_micros();
 
         // Update active orders index if order is active
+        let active_index_start = Instant::now();
         if order.is_active() {
             self.pool_active_orders
                 .entry(order.pool_id)
@@ -76,8 +89,27 @@ impl OrderStore {
                 .or_insert_with(HashSet::new)
                 .insert(key);
         }
+        let active_index_us = active_index_start.elapsed().as_micros();
 
+        let primary_insert_start = Instant::now();
         self.orders.insert(key, order);
+        let primary_insert_us = primary_insert_start.elapsed().as_micros();
+
+        let duration_us = start.elapsed().as_micros();
+        debug!(
+            order_id = order_id,
+            pool_id = ?pool_id,
+            user = ?user,
+            side = ?side,
+            price = ?price,
+            is_active = is_active,
+            total_orders = self.orders.len(),
+            user_index_us = user_index_us,
+            active_index_us = active_index_us,
+            primary_insert_us = primary_insert_us,
+            total_us = duration_us,
+            "Order stored in memory"
+        );
     }
 
     /// Get order by key
@@ -95,12 +127,17 @@ impl OrderStore {
     where
         F: FnOnce(&mut Order),
     {
+        let start = Instant::now();
+        let order_id = key.order_id;
+        let pool_id = key.pool_id;
+
         if let Some(mut order_ref) = self.orders.get_mut(key) {
             let old_was_active = order_ref.is_active();
 
             update_fn(&mut order_ref);
 
             let is_now_active = order_ref.is_active();
+            let status_changed = old_was_active != is_now_active;
 
             // Handle index updates if active status changed
             if old_was_active && !is_now_active {
@@ -108,6 +145,23 @@ impl OrderStore {
             } else if !old_was_active && is_now_active {
                 self.add_to_active_indexes(key, &order_ref);
             }
+
+            let duration_us = start.elapsed().as_micros();
+            debug!(
+                order_id = order_id,
+                pool_id = ?pool_id,
+                old_active = old_was_active,
+                new_active = is_now_active,
+                status_changed = status_changed,
+                update_us = duration_us,
+                "Order updated in memory store"
+            );
+        } else {
+            debug!(
+                order_id = order_id,
+                pool_id = ?pool_id,
+                "Order not found for update in memory store"
+            );
         }
     }
 

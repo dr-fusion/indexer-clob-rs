@@ -4,12 +4,13 @@ use indexer_core::events::{
     Deposit, Lock, OrderCancelled, OrderMatched, OrderPlaced, PoolCreated, TransferFrom,
     TransferLockedFrom, Unlock, UpdateOrder, Withdrawal,
 };
-use indexer_core::types::OrderStatus;
+use indexer_core::types::{now_micros, OrderStatus};
 use indexer_core::{IndexerConfig, Result};
 use indexer_store::IndexerStore;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
-use tracing::{trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::handlers::{
     BalanceEventHandler, OrderCancelledHandler, OrderMatchedHandler, OrderPlacedHandler,
@@ -89,6 +90,8 @@ impl EventProcessor {
 
     /// Process a single log, routing to the appropriate handler
     pub async fn process_log(&self, log: Log) -> Result<()> {
+        let process_start = Instant::now();
+
         let topic0 = match log.topics().first() {
             Some(t) => t,
             None => {
@@ -100,14 +103,27 @@ impl EventProcessor {
         let tx_hash = format!("{:?}", log.transaction_hash.unwrap_or_default());
         let block_number = log.block_number.unwrap_or_default();
         let log_index = log.log_index.unwrap_or_default() as u64;
+        let address = log.address();
         let timestamp = 0u64; // We'll get this from the event where available
+
+        debug!(
+            block = block_number,
+            log_index = log_index,
+            address = ?address,
+            topic0 = ?topic0,
+            tx_hash = %tx_hash,
+            "Processing log event"
+        );
 
         // Route to appropriate handler based on event signature
         match *topic0 {
             sig if sig == PoolCreated::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.pool_created.handle(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = PoolCreated::decode_log(&log.inner) {
                     let sink_event = SinkEvent::PoolCreated(PoolCreatedEvent {
                         pool_id: format!("{:?}", event.poolId),
@@ -121,13 +137,48 @@ impl EventProcessor {
                     });
                     self.emit_to_sinks(sink_event).await;
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "PoolCreated",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed PoolCreated event"
+                );
                 Ok(())
             }
             sig if sig == OrderPlaced::SIGNATURE_HASH => {
+                let pipeline_entered_at = now_micros();
+
+                debug!(
+                    event = "OrderPlaced",
+                    block = block_number,
+                    log_index = log_index,
+                    pipeline_start = pipeline_entered_at,
+                    "Processing OrderPlaced - entering pipeline"
+                );
+
+                let handler_start = Instant::now();
                 self.order_placed.handle(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
+
+                debug!(
+                    event = "OrderPlaced",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    "OrderPlaced handler complete"
+                );
 
                 // Emit to sinks
+                let sink_start = Instant::now();
+                let mut order_id_for_log: u64 = 0;
                 if let Ok(event) = OrderPlaced::decode_log(&log.inner) {
+                    order_id_for_log = event.orderId.to::<u64>();
                     let orderbook_address = log.address();
                     if let Some(pool_id) = self.store.pools.get_pool_id_by_orderbook(&orderbook_address) {
                         let sink_event = SinkEvent::OrderPlaced(OrderEvent {
@@ -149,13 +200,61 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "OrderPlaced",
+                    block = block_number,
+                    log_index = log_index,
+                    sink_us = sink_duration_us,
+                    "OrderPlaced sinks complete"
+                );
+
+                // Summary log at INFO level for easy visibility
+                info!(
+                    event = "OrderPlaced",
+                    block = block_number,
+                    log_index = log_index,
+                    order_id = order_id_for_log,
+                    pipeline_start = pipeline_entered_at,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "OrderPlaced complete"
+                );
                 Ok(())
             }
             sig if sig == OrderMatched::SIGNATURE_HASH => {
+                let pipeline_entered_at = now_micros();
+
+                debug!(
+                    event = "OrderMatched",
+                    block = block_number,
+                    log_index = log_index,
+                    pipeline_start = pipeline_entered_at,
+                    "Processing OrderMatched - entering pipeline"
+                );
+
+                let handler_start = Instant::now();
                 self.order_matched.handle(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
+
+                debug!(
+                    event = "OrderMatched",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    "OrderMatched handler complete"
+                );
 
                 // Emit to sinks
+                let sink_start = Instant::now();
+                let mut buy_order_id_log: u64 = 0;
+                let mut sell_order_id_log: u64 = 0;
                 if let Ok(event) = OrderMatched::decode_log(&log.inner) {
+                    buy_order_id_log = event.buyOrderId.to::<u64>();
+                    sell_order_id_log = event.sellOrderId.to::<u64>();
                     let orderbook_address = log.address();
                     if let Some(pool_id) = self.store.pools.get_pool_id_by_orderbook(&orderbook_address) {
                         let sink_event = SinkEvent::OrderMatched(TradeEvent {
@@ -175,12 +274,39 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "OrderMatched",
+                    block = block_number,
+                    log_index = log_index,
+                    sink_us = sink_duration_us,
+                    "OrderMatched sinks complete"
+                );
+
+                // Summary log at INFO level for easy visibility
+                info!(
+                    event = "OrderMatched",
+                    block = block_number,
+                    log_index = log_index,
+                    buy_order = buy_order_id_log,
+                    sell_order = sell_order_id_log,
+                    pipeline_start = pipeline_entered_at,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "OrderMatched complete"
+                );
                 Ok(())
             }
             sig if sig == UpdateOrder::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.order_updated.handle(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = UpdateOrder::decode_log(&log.inner) {
                     let orderbook_address = log.address();
                     if let Some(pool_id) = self.store.pools.get_pool_id_by_orderbook(&orderbook_address) {
@@ -216,12 +342,27 @@ impl EventProcessor {
                         }
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "UpdateOrder",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed UpdateOrder event"
+                );
                 Ok(())
             }
             sig if sig == OrderCancelled::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.order_cancelled.handle(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = OrderCancelled::decode_log(&log.inner) {
                     let orderbook_address = log.address();
                     if let Some(pool_id) = self.store.pools.get_pool_id_by_orderbook(&orderbook_address) {
@@ -251,12 +392,27 @@ impl EventProcessor {
                         }
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "OrderCancelled",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed OrderCancelled event"
+                );
                 Ok(())
             }
             sig if sig == Deposit::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.balance_handler.handle_deposit(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = Deposit::decode_log(&log.inner) {
                     // Get current balance from store
                     if let Some(balance) = self.store.balances.get(&event.user, &event.id) {
@@ -274,12 +430,27 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "Deposit",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed Deposit event"
+                );
                 Ok(())
             }
             sig if sig == Withdrawal::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.balance_handler.handle_withdrawal(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = Withdrawal::decode_log(&log.inner) {
                     if let Some(balance) = self.store.balances.get(&event.user, &event.id) {
                         let sink_event = SinkEvent::BalanceChanged(SinkBalanceEvent {
@@ -296,12 +467,27 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "Withdrawal",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed Withdrawal event"
+                );
                 Ok(())
             }
             sig if sig == Lock::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.balance_handler.handle_lock(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = Lock::decode_log(&log.inner) {
                     if let Some(balance) = self.store.balances.get(&event.user, &event.id) {
                         let sink_event = SinkEvent::BalanceChanged(SinkBalanceEvent {
@@ -318,12 +504,27 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "Lock",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed Lock event"
+                );
                 Ok(())
             }
             sig if sig == Unlock::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.balance_handler.handle_unlock(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks
+                let sink_start = Instant::now();
                 if let Ok(event) = Unlock::decode_log(&log.inner) {
                     if let Some(balance) = self.store.balances.get(&event.user, &event.id) {
                         let sink_event = SinkEvent::BalanceChanged(SinkBalanceEvent {
@@ -340,12 +541,27 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "Unlock",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed Unlock event"
+                );
                 Ok(())
             }
             sig if sig == TransferFrom::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.balance_handler.handle_transfer_from(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks for both sender and receiver
+                let sink_start = Instant::now();
                 if let Ok(event) = TransferFrom::decode_log(&log.inner) {
                     // Sender balance
                     if let Some(balance) = self.store.balances.get(&event.sender, &event.id) {
@@ -379,12 +595,27 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "TransferFrom",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed TransferFrom event"
+                );
                 Ok(())
             }
             sig if sig == TransferLockedFrom::SIGNATURE_HASH => {
+                let handler_start = Instant::now();
                 self.balance_handler.handle_transfer_locked_from(&log).await?;
+                let handler_duration_us = handler_start.elapsed().as_micros();
 
                 // Emit to sinks for both sender and receiver
+                let sink_start = Instant::now();
                 if let Ok(event) = TransferLockedFrom::decode_log(&log.inner) {
                     // Sender balance
                     if let Some(balance) = self.store.balances.get(&event.sender, &event.id) {
@@ -418,6 +649,18 @@ impl EventProcessor {
                         self.emit_to_sinks(sink_event).await;
                     }
                 }
+                let sink_duration_us = sink_start.elapsed().as_micros();
+                let total_duration_us = process_start.elapsed().as_micros();
+
+                debug!(
+                    event = "TransferLockedFrom",
+                    block = block_number,
+                    log_index = log_index,
+                    handler_us = handler_duration_us,
+                    sink_us = sink_duration_us,
+                    total_us = total_duration_us,
+                    "Processed TransferLockedFrom event"
+                );
                 Ok(())
             }
             _ => {

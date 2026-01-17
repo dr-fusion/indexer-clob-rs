@@ -56,7 +56,7 @@ impl SyncConfig {
         let retry_attempts = env::var("SYNC_RETRY_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+            .unwrap_or(10);
 
         let retry_delay_ms = env::var("SYNC_RETRY_DELAY_MS")
             .ok()
@@ -85,17 +85,39 @@ impl EnvConfig {
             .parse::<u64>()
             .map_err(|_| IndexerError::MissingEnvVar("CHAIN_ID (invalid format)".to_string()))?;
 
-        let rpc_url = env::var("RPC_URL")
-            .map_err(|_| IndexerError::MissingEnvVar("RPC_URL".to_string()))?;
+        let rpc_url = Self::sanitize_url(
+            env::var("RPC_URL")
+                .map_err(|_| IndexerError::MissingEnvVar("RPC_URL".to_string()))?,
+        );
 
-        let ws_url = env::var("WS_URL")
-            .map_err(|_| IndexerError::MissingEnvVar("WS_URL".to_string()))?;
+        let ws_url = Self::sanitize_url(
+            env::var("WS_URL")
+                .map_err(|_| IndexerError::MissingEnvVar("WS_URL".to_string()))?,
+        );
+
+        // Log the URLs being used (helpful for debugging connection issues)
+        eprintln!("[Config] RPC_URL: {}", rpc_url);
+        eprintln!("[Config] WS_URL: {}", ws_url);
 
         Ok(Self {
             chain_id,
             rpc_url,
             ws_url,
         })
+    }
+
+    /// Sanitize URL by removing surrounding quotes and whitespace
+    fn sanitize_url(url: String) -> String {
+        let trimmed = url.trim();
+        // Remove surrounding double quotes if present
+        let without_quotes = if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            &trimmed[1..trimmed.len() - 1]
+        } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            &trimmed[1..trimmed.len() - 1]
+        } else {
+            trimmed
+        };
+        without_quotes.to_string()
     }
 }
 

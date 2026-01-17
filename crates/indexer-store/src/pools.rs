@@ -1,6 +1,8 @@
 use alloy_primitives::{Address, FixedBytes};
 use dashmap::DashMap;
 use indexer_core::types::Pool;
+use std::time::Instant;
+use tracing::debug;
 
 /// Thread-safe store for trading pools
 #[derive(Debug)]
@@ -21,9 +23,22 @@ impl PoolStore {
 
     /// Insert a new pool
     pub fn insert(&self, pool: Pool) {
+        let start = Instant::now();
+        let pool_id = pool.pool_id;
+        let orderbook = pool.order_book_address;
+
         self.orderbook_index
             .insert(pool.order_book_address, pool.pool_id);
         self.pools.insert(pool.pool_id, pool);
+
+        let duration_us = start.elapsed().as_micros();
+        debug!(
+            pool_id = ?pool_id,
+            orderbook = ?orderbook,
+            total_pools = self.pools.len(),
+            insert_us = duration_us,
+            "Pool inserted into memory store"
+        );
     }
 
     /// Get pool by ID
@@ -64,6 +79,7 @@ impl PoolStore {
 
     /// Bulk insert pools (for restoring state from database)
     pub fn bulk_insert(&self, pools: impl IntoIterator<Item = Pool>) -> usize {
+        let start = Instant::now();
         let mut count = 0;
         for pool in pools {
             self.orderbook_index
@@ -71,6 +87,13 @@ impl PoolStore {
             self.pools.insert(pool.pool_id, pool);
             count += 1;
         }
+        let duration_us = start.elapsed().as_micros();
+        debug!(
+            inserted = count,
+            total_pools = self.pools.len(),
+            bulk_insert_us = duration_us,
+            "Bulk inserted pools into memory store"
+        );
         count
     }
 }

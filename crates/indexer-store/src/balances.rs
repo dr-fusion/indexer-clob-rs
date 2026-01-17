@@ -2,6 +2,8 @@ use alloy_primitives::{Address, U256};
 use dashmap::DashMap;
 use indexer_core::types::{BalanceEvent, BalanceEventType, BalanceKey, UserBalance};
 use std::collections::HashSet;
+use std::time::Instant;
+use tracing::debug;
 
 /// Thread-safe store for user balances
 #[derive(Debug)]
@@ -23,6 +25,12 @@ impl BalanceStore {
 
     /// Apply a balance event
     pub fn apply_event(&self, event: &BalanceEvent) {
+        let start = Instant::now();
+        let event_type = event.event_type;
+        let user = event.user;
+        let token_id = event.token_id;
+        let amount = event.amount;
+
         let key = BalanceKey {
             user: event.user,
             token_id: event.token_id,
@@ -39,6 +47,9 @@ impl BalanceStore {
             .balances
             .entry(key)
             .or_insert_with(|| UserBalance::new(event.user, event.token_id));
+
+        let prev_available = balance.available;
+        let prev_locked = balance.locked;
 
         match event.event_type {
             BalanceEventType::Deposit => {
@@ -64,6 +75,21 @@ impl BalanceStore {
         }
 
         balance.update_total();
+
+        let duration_us = start.elapsed().as_micros();
+        debug!(
+            event_type = ?event_type,
+            user = ?user,
+            token_id = ?token_id,
+            amount = ?amount,
+            prev_available = ?prev_available,
+            new_available = ?balance.available,
+            prev_locked = ?prev_locked,
+            new_locked = ?balance.locked,
+            total_balances = self.balances.len(),
+            apply_us = duration_us,
+            "Balance event applied in memory store"
+        );
     }
 
     /// Get balance for user and token
