@@ -12,6 +12,7 @@ use crate::gap_detector::GapDetector;
 use crate::historical::HistoricalSyncer;
 use crate::provider::ProviderManager;
 use crate::realtime::RealtimeSyncer;
+use crate::rpc_verifier::RpcVerifier;
 
 /// Main sync engine that orchestrates historical and real-time sync
 pub struct SyncEngine {
@@ -123,10 +124,25 @@ impl SyncEngine {
             self.processor.clone(),
         );
 
+        // Spawn RPC verification task (runs in background at configurable intervals)
+        let verifier = RpcVerifier::new(
+            self.config.clone(),
+            self.provider.clone(),
+            self.processor.clone(),
+            self.store.clone(),
+            Arc::clone(&self.shutdown_flag),
+        );
+        let verification_handle = tokio::spawn(async move {
+            if let Err(e) = verifier.run().await {
+                error!(error = %e, "RPC verification task failed");
+            }
+        });
+
         loop {
             select! {
                 _ = shutdown.recv() => {
                     info!("Shutdown signal received");
+                    verification_handle.abort();
                     break;
                 }
 

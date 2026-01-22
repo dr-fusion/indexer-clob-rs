@@ -8,6 +8,7 @@ use indexer_core::events::{
 use indexer_core::types::now_micros;
 use indexer_core::{IndexerConfig, IndexerError, Result};
 use indexer_processor::EventProcessor;
+use indexer_store::EventId;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -156,6 +157,20 @@ impl RealtimeSyncer {
         Duration::from_millis((base_delay + jitter) as u64)
     }
 
+    /// Record an event identifier in the verification buffer
+    /// Called after process_log() to track what WebSocket has received
+    fn record_event_for_verification(&self, log: &alloy::rpc::types::Log) {
+        if let (Some(tx_hash), Some(log_index), Some(block_number)) =
+            (log.transaction_hash, log.log_index, log.block_number)
+        {
+            let event_id = EventId::new(tx_hash, log_index as u64);
+            self.processor
+                .store()
+                .ws_event_buffer
+                .record_event(block_number, event_id);
+        }
+    }
+
     /// Run the real-time syncer with WebSocket and automatic reconnection
     pub async fn run(&mut self, _gap_tx: mpsc::Sender<u64>) -> Result<()> {
         info!(
@@ -177,6 +192,12 @@ impl RealtimeSyncer {
                 state.set_last_synced_block(self.start_from_block);
             }
         }
+
+        // Initialize verification buffer start block for RPC verification
+        self.processor
+            .store()
+            .ws_event_buffer
+            .set_verification_start(self.start_from_block);
 
         let mut reconnect_attempts = 0u32;
         let config = ReconnectConfig::from_env();
@@ -567,7 +588,10 @@ impl RealtimeSyncer {
                                     );
 
                                     // Process through existing pipeline
-                                    self.processor.process_log(log).await?;
+                                    self.processor.process_log(log.clone()).await?;
+
+                                    // Record event ID for RPC verification (tracking only)
+                                    self.record_event_for_verification(&log);
 
                                     let process_us = process_start.elapsed().as_micros();
                                     debug!(
@@ -691,7 +715,11 @@ impl RealtimeSyncer {
                                 );
 
                                 // Process the log
-                                self.processor.process_log(log).await?;
+                                self.processor.process_log(log.clone()).await?;
+
+                                // Record event ID for RPC verification (tracking only)
+                                self.record_event_for_verification(&log);
+
                                 let process_us = process_start.elapsed().as_micros();
 
                                 debug!(

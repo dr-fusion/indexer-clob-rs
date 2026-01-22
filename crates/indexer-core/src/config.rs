@@ -42,6 +42,8 @@ pub struct IndexerConfig {
     pub sync: SyncConfig,
     /// Enable miniBlocks subscription (MegaETH-specific)
     pub miniblocks_enabled: bool,
+    /// RPC verification configuration for catching missed WebSocket events
+    pub verification: VerificationConfig,
 }
 
 /// Sync-related configuration
@@ -73,6 +75,55 @@ impl SyncConfig {
 }
 
 impl Default for SyncConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// RPC verification configuration for catching missed WebSocket events
+#[derive(Debug, Clone)]
+pub struct VerificationConfig {
+    /// Enable periodic RPC verification (default: true if VERIFICATION_RPC_URL is set)
+    pub enabled: bool,
+    /// Verification interval in seconds (default: 30)
+    pub interval_secs: u64,
+    /// Second RPC URL for cross-verification
+    pub rpc_url: Option<String>,
+}
+
+impl VerificationConfig {
+    pub fn from_env() -> Self {
+        let rpc_url = env::var("VERIFICATION_RPC_URL").ok().map(|url| {
+            // Reuse URL sanitization logic
+            let trimmed = url.trim();
+            let without_quotes = if trimmed.starts_with('"') && trimmed.ends_with('"') {
+                &trimmed[1..trimmed.len() - 1]
+            } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+                &trimmed[1..trimmed.len() - 1]
+            } else {
+                trimmed
+            };
+            without_quotes.to_string()
+        });
+
+        let enabled = env::var("VERIFICATION_ENABLED")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(rpc_url.is_some()); // Default: enabled if RPC URL is set
+
+        let interval_secs = env::var("VERIFICATION_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+
+        Self {
+            enabled,
+            interval_secs,
+            rpc_url,
+        }
+    }
+}
+
+impl Default for VerificationConfig {
     fn default() -> Self {
         Self::from_env()
     }
@@ -152,6 +203,20 @@ impl IndexerConfig {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        // RPC verification configuration
+        let verification = VerificationConfig::from_env();
+        if verification.enabled {
+            if let Some(ref url) = verification.rpc_url {
+                eprintln!("[Config] VERIFICATION_RPC_URL: {}", url);
+                eprintln!(
+                    "[Config] Verification enabled with {}s interval",
+                    verification.interval_secs
+                );
+            } else {
+                eprintln!("[Config] Verification enabled but no VERIFICATION_RPC_URL set - will use primary RPC only");
+            }
+        }
+
         Ok(Self {
             chain_id: env_config.chain_id,
             rpc_url: env_config.rpc_url,
@@ -163,6 +228,7 @@ impl IndexerConfig {
             fee_receiver: deployment.fee_receiver,
             sync: SyncConfig::default(),
             miniblocks_enabled,
+            verification,
         })
     }
 }

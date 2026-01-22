@@ -34,7 +34,7 @@ This is a CLOB (Central Limit Order Book) DEX indexer for MegaETH chain, organiz
 crates/
 ├── indexer-core/       # Foundation: types, events, config (no deps on other crates)
 ├── indexer-store/      # In-memory concurrent storage (DashMap-based)
-├── indexer-sync/       # Dual-phase sync engine (historical + real-time)
+├── indexer-sync/       # Dual-phase sync engine (historical + real-time + verification)
 ├── indexer-processor/  # Event routing, handlers, and sinks
 ├── indexer-db/         # PostgreSQL persistence with SQLx
 ├── indexer-redis/      # Redis streaming publisher
@@ -54,16 +54,19 @@ Blockchain → SyncEngine → EventProcessor → [Sinks] → Storage
 
 ### Sync Engine (indexer-sync)
 
-The sync engine uses a dual-phase approach:
+The sync engine uses a three-component approach:
 
 1. **Historical Sync** (`historical.rs`): Fetches past events via `eth_getLogs` with adaptive AIMD batch sizing
 2. **Real-time Sync** (`realtime.rs`): WebSocket subscription with ~10ms latency for MegaETH mini-blocks
 3. **Gap Detection** (`gap_detector.rs`): Monitors and fills missed blocks during WebSocket operation
+4. **RPC Verification** (`rpc_verifier.rs`): Background task that periodically verifies WebSocket events against RPC
 
 Key patterns:
 - AIMD (Additive Increase, Multiplicative Decrease) for batch sizing and concurrency control
 - Verification loop ensures no gaps before switching to real-time mode
 - BlockRangeTracker (`adaptive_batch.rs`) tracks contiguous synced ranges
+- MiniBlocks subscription (`MINIBLOCKS_ENABLED=true`) provides transaction receipts with logs directly
+- WebSocketEventBuffer (`ws_event_buffer.rs`) tracks events for RPC verification comparison
 
 ### Event Processing (indexer-processor)
 
@@ -80,10 +83,12 @@ Key patterns:
 ## Key Implementation Details
 
 - **Startup sequence**: Pools are loaded from database BEFORE WebSocket subscription to ensure filter accuracy
-- **Shutdown coordination**: AtomicBool flag checked throughout async tasks for graceful shutdown
+- **Resume logic**: Checks `sync_state` table for last synced block; resumes from `last_block + 1`
+- **Shutdown coordination**: broadcast channel signals shutdown; components flush data before DB pool closes (order matters: candle aggregator → batch writer → DB pool)
 - **Concurrency**: DashMap for lock-free concurrent access, no mutexes needed for stores
 - **Contract addresses**: Loaded from `deployments/{CHAIN_ID}.json`
 - **Environment config**: See `.env.example` for all configuration options
+- **RPC Verification**: Background task compares WebSocket events with dual-RPC fetches to catch missed events
 
 ## Indexed Events
 
@@ -115,3 +120,24 @@ indexer-api (depends on core, store, db)
 - **sqlx**: PostgreSQL with compile-time checked queries
 - **async-graphql + axum**: GraphQL API
 - **dashmap**: Lock-free concurrent HashMap
+- **tokio-tungstenite**: WebSocket client for real-time sync
+
+## Common Environment Variables
+
+Required:
+- `CHAIN_ID`, `RPC_URL`, `WS_URL`
+
+Optional services:
+- `DATABASE_URL` - enables persistence (PostgreSQL)
+- `REDIS_URL` - enables real-time streaming
+- `METRICS_PORT` or `METRICS_ENABLED` - enables Prometheus metrics
+
+Real-time tuning:
+- `MINIBLOCKS_ENABLED=true` - use MegaETH miniBlocks subscription
+- `WS_PING_INTERVAL_SECS`, `WS_RPC_KEEPALIVE_SECS` - WebSocket keepalive
+- `WS_RECONNECT_INITIAL_MS`, `WS_RECONNECT_MAX_MS` - reconnection backoff
+
+RPC verification (catches WebSocket missed events):
+- `VERIFICATION_ENABLED=true` - enable background RPC verification
+- `VERIFICATION_INTERVAL_SECS=30` - verification cycle interval
+- `VERIFICATION_RPC_URL` - secondary RPC for dual-source comparison (recommended)
