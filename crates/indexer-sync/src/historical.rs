@@ -613,12 +613,15 @@ impl HistoricalSyncer {
                         "New pools discovered, fetching orderbook events for this and subsequent batches"
                     );
 
-                    // Fetch orderbook events for THIS batch
-                    let new_pool_logs = Self::fetch_orderbook_events_for_pools(
+                    // Fetch orderbook events for THIS batch (with retry/split on errors)
+                    let new_pool_logs = Self::fetch_orderbook_events_with_retry(
                         &self.provider,
                         &new_orderbooks,
                         from,
                         to,
+                        self.config.sync.retry_attempts,
+                        self.config.sync.retry_delay_ms,
+                        0, // depth
                     ).await?;
 
                     additional_events += new_pool_logs.len();
@@ -647,6 +650,8 @@ impl HistoricalSyncer {
                         let provider = Arc::clone(&self.provider);
                         let new_orderbooks_arc = Arc::new(new_orderbooks.clone());
                         let total_subsequent = num_subsequent;
+                        let max_retries = self.config.sync.retry_attempts;
+                        let retry_delay_ms = self.config.sync.retry_delay_ms;
 
                         let refetch_results: Vec<(usize, Vec<Log>)> = stream::iter(subsequent_batches)
                             .map(|(idx, sub_from, sub_to)| {
@@ -659,15 +664,18 @@ impl HistoricalSyncer {
                                         blocks = format!("{}-{}", sub_from, sub_to),
                                         block_count = sub_to - sub_from + 1,
                                         new_pools = orderbooks.len(),
-                                        "Re-fetching orderbook events (1 RPC call)"
+                                        "Re-fetching orderbook events (with retry/split)"
                                     );
 
                                     let fetch_start = std::time::Instant::now();
-                                    let result = Self::fetch_orderbook_events_for_pools(
+                                    let result = Self::fetch_orderbook_events_with_retry(
                                         &provider,
                                         &orderbooks,
                                         sub_from,
                                         sub_to,
+                                        max_retries,
+                                        retry_delay_ms,
+                                        0, // depth
                                     ).await;
                                     let fetch_ms = fetch_start.elapsed().as_millis();
 
@@ -686,13 +694,13 @@ impl HistoricalSyncer {
                                             (idx, logs)
                                         }
                                         Err(e) => {
-                                            warn!(
+                                            error!(
                                                 batch = idx + 1,
                                                 from = sub_from,
                                                 to = sub_to,
                                                 fetch_ms = fetch_ms,
                                                 error = %e,
-                                                "Failed to re-fetch orderbook events for batch"
+                                                "Failed to re-fetch orderbook events for batch after retries"
                                             );
                                             (idx, vec![])
                                         }
@@ -1473,5 +1481,142 @@ impl HistoricalSyncer {
                 Err(IndexerError::Rpc(format!("{:?}", e)))
             }
         }
+    }
+
+    /// Fetch orderbook events with retry and range splitting on "too many logs" errors
+    /// Similar to fetch_with_split but for orderbook-only fetches
+    fn fetch_orderbook_events_with_retry<'a>(
+        provider: &'a ProviderManager,
+        orderbook_addresses: &'a [alloy::primitives::Address],
+        from: u64,
+        to: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        depth: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Log>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut attempts = 0u32;
+            let mut delay = Duration::from_millis(retry_delay_ms);
+            let max_delay = Duration::from_secs(30);
+            let max_depth = 10; // Prevent infinite recursion
+
+            loop {
+                attempts += 1;
+
+                let fetch_start = std::time::Instant::now();
+                let result = Self::fetch_orderbook_events_for_pools(
+                    provider,
+                    orderbook_addresses,
+                    from,
+                    to,
+                ).await;
+                let fetch_ms = fetch_start.elapsed().as_millis();
+
+                match result {
+                    Ok(logs) => {
+                        if attempts > 1 || depth > 0 {
+                            info!(
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                attempts = attempts,
+                                depth = depth,
+                                events = logs.len(),
+                                "Orderbook re-fetch succeeded after retry"
+                            );
+                        }
+                        return Ok(logs);
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string().to_lowercase();
+                        let is_too_many = Self::is_too_many_logs_error(&err_msg);
+
+                        // For "too many logs" errors, split the range and fetch recursively
+                        if is_too_many && from < to && depth < max_depth {
+                            let mid = from + (to - from) / 2;
+                            warn!(
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                split_at = mid,
+                                depth = depth,
+                                fetch_ms = fetch_ms,
+                                "Too many logs in orderbook re-fetch - splitting range in half"
+                            );
+
+                            // Fetch first half
+                            let mut logs = Self::fetch_orderbook_events_with_retry(
+                                provider,
+                                orderbook_addresses,
+                                from,
+                                mid,
+                                max_retries,
+                                retry_delay_ms,
+                                depth + 1,
+                            ).await?;
+
+                            // Fetch second half
+                            let logs2 = Self::fetch_orderbook_events_with_retry(
+                                provider,
+                                orderbook_addresses,
+                                mid + 1,
+                                to,
+                                max_retries,
+                                retry_delay_ms,
+                                depth + 1,
+                            ).await?;
+
+                            // Combine and sort by (block_number, log_index)
+                            logs.extend(logs2);
+                            logs.sort_by(|a, b| {
+                                let block_a = a.block_number.unwrap_or(0);
+                                let block_b = b.block_number.unwrap_or(0);
+                                let idx_a = a.log_index.unwrap_or(0);
+                                let idx_b = b.log_index.unwrap_or(0);
+                                (block_a, idx_a).cmp(&(block_b, idx_b))
+                            });
+
+                            return Ok(logs);
+                        }
+
+                        // For other retryable errors, use exponential backoff
+                        if attempts < max_retries && Self::is_retryable_error(&e) {
+                            let actual_delay = if Self::is_rate_limit_error(&err_msg) {
+                                let retry_secs = Self::parse_retry_seconds(&err_msg).unwrap_or(10);
+                                Duration::from_secs(retry_secs)
+                            } else {
+                                delay
+                            };
+
+                            warn!(
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                attempt = attempts,
+                                max_retries = max_retries,
+                                delay_ms = actual_delay.as_millis(),
+                                fetch_ms = fetch_ms,
+                                error = %e,
+                                "Orderbook re-fetch failed, retrying with backoff"
+                            );
+
+                            tokio::time::sleep(actual_delay).await;
+                            delay = (delay * 2).min(max_delay);
+                        } else {
+                            error!(
+                                from = from,
+                                to = to,
+                                blocks = to - from + 1,
+                                attempts = attempts,
+                                fetch_ms = fetch_ms,
+                                error = %e,
+                                "Orderbook re-fetch failed after max retries"
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        })
     }
 }
