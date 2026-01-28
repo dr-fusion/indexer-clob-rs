@@ -34,6 +34,8 @@ pub struct VerificationStats {
     pub ws_events_count: usize,
     pub rpc1_events_count: usize,
     pub rpc2_events_count: usize,
+    pub rpc1_valid_content_id: usize,
+    pub rpc2_valid_content_id: usize,
     pub union_events_count: usize,
     pub missing_events_processed: usize,
     pub duration_ms: u64,
@@ -135,8 +137,10 @@ impl RpcVerifier {
                             to_block = stats.to_block,
                             blocks_verified = stats.blocks_verified,
                             ws_events = stats.ws_events_count,
-                            rpc1_events = stats.rpc1_events_count,
-                            rpc2_events = stats.rpc2_events_count,
+                            rpc1_raw = stats.rpc1_events_count,
+                            rpc1_valid = stats.rpc1_valid_content_id,
+                            rpc2_raw = stats.rpc2_events_count,
+                            rpc2_valid = stats.rpc2_valid_content_id,
                             union_events = stats.union_events_count,
                             missing_events = stats.missing_events_processed,
                             duration_ms = stats.duration_ms,
@@ -168,21 +172,29 @@ impl RpcVerifier {
             // Build RPC info based on whether secondary RPC is configured
             let rpc_info = if stats.rpc2_events_count > 0 {
                 format!(
-                    "RPC1 Events: {}\nRPC2 Events: {}\nUnion Events: {}",
+                    "RPC1: {} raw / {} valid\n\
+                     RPC2: {} raw / {} valid\n\
+                     Union: {}",
                     stats.rpc1_events_count,
+                    stats.rpc1_valid_content_id,
                     stats.rpc2_events_count,
+                    stats.rpc2_valid_content_id,
                     stats.union_events_count
                 )
             } else {
-                format!("RPC Events: {}", stats.rpc1_events_count)
+                format!(
+                    "RPC: {} raw / {} valid",
+                    stats.rpc1_events_count,
+                    stats.rpc1_valid_content_id
+                )
             };
 
             let message = format!(
                 "🚨 <b>Missing Events Detected</b>\n\n\
                  Chain: {}\n\
                  Blocks: {} - {}\n\
-                 Missing Events: {}\n\
-                 WS Events: {}\n\
+                 Missing: {}\n\
+                 WS Buffer: {}\n\
                  {}",
                 self.config.chain_id,
                 stats.from_block,
@@ -286,16 +298,27 @@ impl RpcVerifier {
         let mut rpc_logs_map: std::collections::HashMap<EventContentId, Log> =
             std::collections::HashMap::new();
 
+        let mut rpc1_valid_content_id = 0usize;
         for log in &rpc1_logs {
             if let Some(content_id) = EventContentId::from_log(log) {
+                rpc1_valid_content_id += 1;
                 all_rpc_events.insert(content_id.clone());
                 rpc_logs_map.insert(content_id, log.clone());
+            } else {
+                debug!(
+                    block = ?log.block_number,
+                    log_index = ?log.log_index,
+                    has_tx_hash = log.transaction_hash.is_some(),
+                    "RPC1 log missing tx_hash - cannot create EventContentId"
+                );
             }
         }
 
+        let mut rpc2_valid_content_id = 0usize;
         if let Some(ref logs) = rpc2_logs {
             for log in logs {
                 if let Some(content_id) = EventContentId::from_log(log) {
+                    rpc2_valid_content_id += 1;
                     all_rpc_events.insert(content_id.clone());
                     // Only insert if not already present (prefer primary RPC log)
                     rpc_logs_map.entry(content_id).or_insert_with(|| log.clone());
@@ -307,11 +330,19 @@ impl RpcVerifier {
 
         // Find events in RPC but not in WebSocket buffer (by content, not log_index)
         let mut missing_count = 0;
+        let mut missing_by_type: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+
         for content_id in &all_rpc_events {
             if !ws_events.contains(content_id) {
                 // This event was missed by WebSocket - process it
                 if let Some(log) = rpc_logs_map.get(content_id) {
+                    let event_type = Self::identify_event_type(log);
+                    *missing_by_type.entry(event_type).or_insert(0) += 1;
+
                     debug!(
+                        event_type = event_type,
+                        address = ?log.address(),
                         tx_hash = ?log.transaction_hash,
                         log_index = ?log.log_index,
                         block = ?log.block_number,
@@ -329,6 +360,14 @@ impl RpcVerifier {
                     }
                 }
             }
+        }
+
+        // Log breakdown of missing events by type
+        if !missing_by_type.is_empty() {
+            warn!(
+                missing_breakdown = ?missing_by_type,
+                "Missing events by type"
+            );
         }
 
         // Update buffer statistics
@@ -358,6 +397,8 @@ impl RpcVerifier {
             ws_events_count,
             rpc1_events_count,
             rpc2_events_count,
+            rpc1_valid_content_id,
+            rpc2_valid_content_id,
             union_events_count,
             missing_events_processed: missing_count,
             duration_ms,
@@ -365,8 +406,23 @@ impl RpcVerifier {
         })
     }
 
-    // Note: EventContentId::from_log is used directly for content-based comparison
-    // This avoids relying on log_index which may differ between MiniBlocks and finalized blocks
+    /// Identify event type from log's topic0 signature
+    fn identify_event_type(log: &Log) -> &'static str {
+        match log.topics().first() {
+            Some(t) if *t == PoolCreated::SIGNATURE_HASH => "PoolCreated",
+            Some(t) if *t == OrderPlaced::SIGNATURE_HASH => "OrderPlaced",
+            Some(t) if *t == OrderMatched::SIGNATURE_HASH => "OrderMatched",
+            Some(t) if *t == UpdateOrder::SIGNATURE_HASH => "UpdateOrder",
+            Some(t) if *t == OrderCancelled::SIGNATURE_HASH => "OrderCancelled",
+            Some(t) if *t == Deposit::SIGNATURE_HASH => "Deposit",
+            Some(t) if *t == Withdrawal::SIGNATURE_HASH => "Withdrawal",
+            Some(t) if *t == Lock::SIGNATURE_HASH => "Lock",
+            Some(t) if *t == Unlock::SIGNATURE_HASH => "Unlock",
+            Some(t) if *t == TransferFrom::SIGNATURE_HASH => "TransferFrom",
+            Some(t) if *t == TransferLockedFrom::SIGNATURE_HASH => "TransferLockedFrom",
+            _ => "Unknown",
+        }
+    }
 
     /// Fetch all relevant events for verification using combined filter
     async fn fetch_all_events(
