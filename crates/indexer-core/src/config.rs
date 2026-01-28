@@ -44,6 +44,8 @@ pub struct IndexerConfig {
     pub miniblocks_enabled: bool,
     /// RPC verification configuration for catching missed WebSocket events
     pub verification: VerificationConfig,
+    /// Telegram notification configuration for alerting on missing events
+    pub telegram: TelegramConfig,
 }
 
 /// Sync-related configuration
@@ -124,6 +126,44 @@ impl VerificationConfig {
 }
 
 impl Default for VerificationConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// Telegram notification configuration for alerting on missing events
+#[derive(Debug, Clone)]
+pub struct TelegramConfig {
+    /// Enable Telegram notifications (default: true if bot_token and chat_id are set)
+    pub enabled: bool,
+    /// Telegram bot token from @BotFather
+    pub bot_token: Option<String>,
+    /// Chat ID or channel ID to send messages to
+    pub chat_id: Option<String>,
+}
+
+impl TelegramConfig {
+    pub fn from_env() -> Self {
+        let bot_token = env::var("TELEGRAM_BOT_TOKEN").ok();
+        let chat_id = env::var("TELEGRAM_CHAT_ID").ok();
+        let enabled = env::var("TELEGRAM_ENABLED")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(bot_token.is_some() && chat_id.is_some());
+
+        Self {
+            enabled,
+            bot_token,
+            chat_id,
+        }
+    }
+
+    /// Check if Telegram is fully configured and enabled
+    pub fn is_configured(&self) -> bool {
+        self.enabled && self.bot_token.is_some() && self.chat_id.is_some()
+    }
+}
+
+impl Default for TelegramConfig {
     fn default() -> Self {
         Self::from_env()
     }
@@ -217,6 +257,12 @@ impl IndexerConfig {
             }
         }
 
+        // Telegram notification configuration
+        let telegram = TelegramConfig::from_env();
+        if telegram.is_configured() {
+            eprintln!("[Config] Telegram notifications enabled");
+        }
+
         Ok(Self {
             chain_id: env_config.chain_id,
             rpc_url: env_config.rpc_url,
@@ -229,6 +275,7 @@ impl IndexerConfig {
             sync: SyncConfig::default(),
             miniblocks_enabled,
             verification,
+            telegram,
         })
     }
 }

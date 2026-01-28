@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::adaptive_batch::{AdaptiveBatchConfig, AdaptiveBatchController};
 use crate::provider::{BoxedProvider, ProviderManager};
+use crate::telegram::TelegramNotifier;
 
 /// Statistics from a verification cycle
 #[derive(Debug, Clone, Default)]
@@ -48,6 +49,8 @@ pub struct RpcVerifier {
     store: Arc<IndexerStore>,
     shutdown: Arc<AtomicBool>,
     batch_controller: AdaptiveBatchController,
+    /// Optional Telegram notifier for alerting on missing events
+    telegram_notifier: Option<TelegramNotifier>,
 }
 
 impl RpcVerifier {
@@ -59,6 +62,17 @@ impl RpcVerifier {
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         let batch_config = AdaptiveBatchConfig::from_env();
+
+        // Initialize Telegram notifier if configured
+        let telegram_notifier = if config.telegram.is_configured() {
+            let bot_token = config.telegram.bot_token.clone().unwrap();
+            let chat_id = config.telegram.chat_id.clone().unwrap();
+            info!("Telegram notifications enabled for missing events");
+            Some(TelegramNotifier::new(bot_token, chat_id))
+        } else {
+            None
+        };
+
         Self {
             config,
             primary_provider,
@@ -66,6 +80,7 @@ impl RpcVerifier {
             store,
             shutdown,
             batch_controller: AdaptiveBatchController::new(batch_config),
+            telegram_notifier,
         }
     }
 
@@ -128,6 +143,11 @@ impl RpcVerifier {
                             buffer_cleared = stats.buffer_cleared,
                             "Verification cycle complete"
                         );
+
+                        // Send Telegram alert if missing events detected
+                        if stats.missing_events_processed > 0 {
+                            self.send_telegram_alert(&stats).await;
+                        }
                     } else {
                         debug!("Verification skipped - no blocks to verify");
                     }
@@ -140,6 +160,40 @@ impl RpcVerifier {
         }
 
         Ok(())
+    }
+
+    /// Send a Telegram alert for missing events
+    async fn send_telegram_alert(&self, stats: &VerificationStats) {
+        if let Some(ref notifier) = self.telegram_notifier {
+            // Build RPC info based on whether secondary RPC is configured
+            let rpc_info = if stats.rpc2_events_count > 0 {
+                format!(
+                    "RPC1 Events: {}\nRPC2 Events: {}\nUnion Events: {}",
+                    stats.rpc1_events_count,
+                    stats.rpc2_events_count,
+                    stats.union_events_count
+                )
+            } else {
+                format!("RPC Events: {}", stats.rpc1_events_count)
+            };
+
+            let message = format!(
+                "🚨 <b>Missing Events Detected</b>\n\n\
+                 Chain: {}\n\
+                 Blocks: {} - {}\n\
+                 Missing Events: {}\n\
+                 WS Events: {}\n\
+                 {}",
+                self.config.chain_id,
+                stats.from_block,
+                stats.to_block,
+                stats.missing_events_processed,
+                stats.ws_events_count,
+                rpc_info,
+            );
+
+            notifier.send_message(&message).await;
+        }
     }
 
     /// Execute a single verification cycle

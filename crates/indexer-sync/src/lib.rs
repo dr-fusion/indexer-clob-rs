@@ -5,8 +5,10 @@ mod historical;
 mod provider;
 mod realtime;
 mod rpc_verifier;
+mod telegram;
 
 pub use adaptive_batch::{AdaptiveBatchConfig, AdaptiveBatchController, BlockRangeTracker};
 pub use engine::SyncEngine;
 pub use provider::ProviderManager;
 pub use rpc_verifier::{RpcVerifier, VerificationStats};
+pub use telegram::TelegramNotifier;
