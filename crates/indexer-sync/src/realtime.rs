@@ -1134,6 +1134,18 @@ impl RealtimeSyncer {
                 elapsed_ms = elapsed.as_millis(),
                 "Gap fill complete"
             );
+
+            // Update verification start to skip gap-filled blocks
+            // RPC verification should only verify blocks received via WebSocket,
+            // not blocks filled via gap detection (those were fetched directly from RPC)
+            processor
+                .store()
+                .ws_event_buffer
+                .set_verification_start(first_ws_block);
+            info!(
+                new_verification_start = first_ws_block,
+                "Updated verification start to skip gap-filled blocks"
+            );
         });
     }
 
@@ -1177,10 +1189,19 @@ impl RealtimeSyncer {
             let mut state = self.processor.store().sync_state.write().await;
             state.set_last_synced_block(current_block);
 
+            // Update verification start to skip gap-filled blocks
+            // Next verification cycle should start from current_block + 1
+            drop(state); // Release lock before accessing ws_event_buffer
+            self.processor
+                .store()
+                .ws_event_buffer
+                .set_verification_start(current_block + 1);
+
             info!(
                 from = last_processed + 1,
                 to = current_block,
                 missed_blocks = missed,
+                new_verification_start = current_block + 1,
                 "Gap recovery complete"
             );
         } else {
