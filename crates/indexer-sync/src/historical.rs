@@ -626,38 +626,90 @@ impl HistoricalSyncer {
                         self.processor.process_log(log).await?;
                     }
 
-                    // Fetch orderbook events for ALL subsequent batches in this window
+                    // Fetch orderbook events for ALL subsequent batches in this window IN PARALLEL
                     // These batches were already fetched without knowing about the new pools
-                    for subsequent_batch_idx in (batch_idx + 1)..window_end {
-                        if let Some((sub_from, sub_to, _)) = fetched_window.get(&subsequent_batch_idx) {
-                            let sub_from = *sub_from;
-                            let sub_to = *sub_to;
+                    let subsequent_batches: Vec<(usize, u64, u64)> = ((batch_idx + 1)..window_end)
+                        .filter_map(|idx| {
+                            fetched_window.get(&idx).map(|(from, to, _)| (idx, *from, *to))
+                        })
+                        .collect();
 
-                            info!(
-                                batch = subsequent_batch_idx + 1,
-                                from = sub_from,
-                                to = sub_to,
-                                new_pools = new_orderbooks.len(),
-                                "Re-fetching orderbook events for batch that missed new pools"
-                            );
+                    if !subsequent_batches.is_empty() {
+                        let num_subsequent = subsequent_batches.len();
+                        info!(
+                            batches = num_subsequent,
+                            new_pools = new_orderbooks.len(),
+                            "Re-fetching orderbook events for batches that missed new pools (parallel)"
+                        );
 
-                            let additional_logs = Self::fetch_orderbook_events_for_pools(
-                                &self.provider,
-                                &new_orderbooks,
-                                sub_from,
-                                sub_to,
-                            ).await?;
+                        // Use the same concurrency as the main fetch
+                        let refetch_concurrency = self.concurrency_controller.get();
+                        let provider = Arc::clone(&self.provider);
+                        let new_orderbooks_arc = Arc::new(new_orderbooks.clone());
+                        let total_subsequent = num_subsequent;
 
-                            if !additional_logs.is_empty() {
-                                info!(
-                                    batch = subsequent_batch_idx + 1,
-                                    events = additional_logs.len(),
-                                    "Queued additional orderbook events for subsequent batch"
-                                );
+                        let refetch_results: Vec<(usize, Vec<Log>)> = stream::iter(subsequent_batches)
+                            .map(|(idx, sub_from, sub_to)| {
+                                let provider = Arc::clone(&provider);
+                                let orderbooks = Arc::clone(&new_orderbooks_arc);
+                                async move {
+                                    info!(
+                                        batch = idx + 1,
+                                        total = total_subsequent,
+                                        blocks = format!("{}-{}", sub_from, sub_to),
+                                        block_count = sub_to - sub_from + 1,
+                                        new_pools = orderbooks.len(),
+                                        "Re-fetching orderbook events (1 RPC call)"
+                                    );
+
+                                    let fetch_start = std::time::Instant::now();
+                                    let result = Self::fetch_orderbook_events_for_pools(
+                                        &provider,
+                                        &orderbooks,
+                                        sub_from,
+                                        sub_to,
+                                    ).await;
+                                    let fetch_ms = fetch_start.elapsed().as_millis();
+
+                                    match result {
+                                        Ok(logs) => {
+                                            let event_counts = EventCounts::from_logs(&logs);
+                                            info!(
+                                                batch = idx + 1,
+                                                total = total_subsequent,
+                                                blocks = format!("{}-{}", sub_from, sub_to),
+                                                fetch_ms = fetch_ms,
+                                                events = logs.len(),
+                                                breakdown = %event_counts.summary(),
+                                                "Re-fetch batch complete"
+                                            );
+                                            (idx, logs)
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                batch = idx + 1,
+                                                from = sub_from,
+                                                to = sub_to,
+                                                fetch_ms = fetch_ms,
+                                                error = %e,
+                                                "Failed to re-fetch orderbook events for batch"
+                                            );
+                                            (idx, vec![])
+                                        }
+                                    }
+                                }
+                            })
+                            .buffer_unordered(refetch_concurrency)
+                            .collect()
+                            .await;
+
+                        // Queue the results for processing
+                        for (idx, logs) in refetch_results {
+                            if !logs.is_empty() {
                                 additional_logs_for_batch
-                                    .entry(subsequent_batch_idx)
+                                    .entry(idx)
                                     .or_insert_with(Vec::new)
-                                    .extend(additional_logs);
+                                    .extend(logs);
                             }
                         }
                     }

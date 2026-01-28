@@ -54,7 +54,7 @@ Blockchain → SyncEngine → EventProcessor → [Sinks] → Storage
 
 ### Sync Engine (indexer-sync)
 
-The sync engine uses a three-component approach:
+The sync engine uses a four-component approach:
 
 1. **Historical Sync** (`historical.rs`): Fetches past events via `eth_getLogs` with adaptive AIMD batch sizing
 2. **Real-time Sync** (`realtime.rs`): WebSocket subscription with ~10ms latency for MegaETH mini-blocks
@@ -65,8 +65,10 @@ Key patterns:
 - AIMD (Additive Increase, Multiplicative Decrease) for batch sizing and concurrency control
 - Verification loop ensures no gaps before switching to real-time mode
 - BlockRangeTracker (`adaptive_batch.rs`) tracks contiguous synced ranges
+- ProviderManager (`provider.rs`) handles HTTP client pooling and RPC connection management
 - MiniBlocks subscription (`MINIBLOCKS_ENABLED=true`) provides transaction receipts with logs directly
-- WebSocketEventBuffer (`ws_event_buffer.rs`) tracks events for RPC verification comparison
+- WebSocketEventBuffer (in `indexer-store`) tracks events for RPC verification comparison
+- Topic-based WebSocket subscription by event signatures, not addresses - automatically captures events from newly created pools
 
 ### Event Processing (indexer-processor)
 
@@ -89,6 +91,9 @@ Key patterns:
 - **Contract addresses**: Loaded from `deployments/{CHAIN_ID}.json`
 - **Environment config**: See `.env.example` for all configuration options
 - **RPC Verification**: Background task compares WebSocket events with dual-RPC fetches to catch missed events
+- **WebSocket keepalive**: Sends `eth_chainId` every 30s to prevent connection drops
+- **WebSocket reconnection**: Exponential backoff with jitter; gap recovery via HTTP on reconnect
+- **Error retry**: Immediate retry with exponential backoff on failures (not deferred)
 
 ## Indexed Events
 
