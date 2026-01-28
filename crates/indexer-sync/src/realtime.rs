@@ -8,7 +8,7 @@ use indexer_core::events::{
 use indexer_core::types::now_micros;
 use indexer_core::{IndexerConfig, IndexerError, Result};
 use indexer_processor::EventProcessor;
-use indexer_store::EventId;
+use indexer_store::EventContentId;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -157,17 +157,20 @@ impl RealtimeSyncer {
         Duration::from_millis((base_delay + jitter) as u64)
     }
 
-    /// Record an event identifier in the verification buffer
+    /// Record an event content identifier in the verification buffer
     /// Called after process_log() to track what WebSocket has received
+    ///
+    /// Uses content-based identification (tx_hash + address + topics + data)
+    /// instead of log_index, because MiniBlocks may have different log_index
+    /// values than the finalized EVM block.
     fn record_event_for_verification(&self, log: &alloy::rpc::types::Log) {
-        if let (Some(tx_hash), Some(log_index), Some(block_number)) =
-            (log.transaction_hash, log.log_index, log.block_number)
+        if let (Some(block_number), Some(content_id)) =
+            (log.block_number, EventContentId::from_log(log))
         {
-            let event_id = EventId::new(tx_hash, log_index as u64);
             self.processor
                 .store()
                 .ws_event_buffer
-                .record_event(block_number, event_id);
+                .record_event(block_number, content_id);
         }
     }
 

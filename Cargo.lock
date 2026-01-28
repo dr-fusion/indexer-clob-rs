@@ -2911,6 +2911,7 @@ dependencies = [
 name = "indexer-store"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "alloy-primitives",
  "dashmap",
  "indexer-core",

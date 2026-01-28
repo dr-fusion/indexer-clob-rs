@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 indexer-core.workspace = true
+alloy.workspace = true
 alloy-primitives.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true

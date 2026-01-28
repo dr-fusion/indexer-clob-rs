@@ -13,7 +13,7 @@ use indexer_core::events::{
 };
 use indexer_core::{IndexerConfig, IndexerError, Result};
 use indexer_processor::EventProcessor;
-use indexer_store::{EventId, IndexerStore};
+use indexer_store::{EventContentId, IndexerStore};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -227,36 +227,36 @@ impl RpcVerifier {
             None => (None, 0),
         };
 
-        // Union of both RPC results (dedupe by EventId)
-        let mut all_rpc_events: HashSet<EventId> = HashSet::new();
-        let mut rpc_logs_map: std::collections::HashMap<EventId, Log> =
+        // Union of both RPC results (dedupe by EventContentId - content-based comparison)
+        let mut all_rpc_events: HashSet<EventContentId> = HashSet::new();
+        let mut rpc_logs_map: std::collections::HashMap<EventContentId, Log> =
             std::collections::HashMap::new();
 
         for log in &rpc1_logs {
-            if let Some(event_id) = Self::event_id_from_log(log) {
-                all_rpc_events.insert(event_id);
-                rpc_logs_map.insert(event_id, log.clone());
+            if let Some(content_id) = EventContentId::from_log(log) {
+                all_rpc_events.insert(content_id.clone());
+                rpc_logs_map.insert(content_id, log.clone());
             }
         }
 
         if let Some(ref logs) = rpc2_logs {
             for log in logs {
-                if let Some(event_id) = Self::event_id_from_log(log) {
-                    all_rpc_events.insert(event_id);
+                if let Some(content_id) = EventContentId::from_log(log) {
+                    all_rpc_events.insert(content_id.clone());
                     // Only insert if not already present (prefer primary RPC log)
-                    rpc_logs_map.entry(event_id).or_insert_with(|| log.clone());
+                    rpc_logs_map.entry(content_id).or_insert_with(|| log.clone());
                 }
             }
         }
 
         let union_events_count = all_rpc_events.len();
 
-        // Find events in RPC but not in WebSocket buffer
+        // Find events in RPC but not in WebSocket buffer (by content, not log_index)
         let mut missing_count = 0;
-        for event_id in &all_rpc_events {
-            if !ws_events.contains(event_id) {
+        for content_id in &all_rpc_events {
+            if !ws_events.contains(content_id) {
                 // This event was missed by WebSocket - process it
-                if let Some(log) = rpc_logs_map.get(event_id) {
+                if let Some(log) = rpc_logs_map.get(content_id) {
                     debug!(
                         tx_hash = ?log.transaction_hash,
                         log_index = ?log.log_index,
@@ -311,12 +311,8 @@ impl RpcVerifier {
         })
     }
 
-    /// Extract EventId from a log
-    fn event_id_from_log(log: &Log) -> Option<EventId> {
-        let tx_hash = log.transaction_hash?;
-        let log_index = log.log_index? as u64;
-        Some(EventId::new(tx_hash, log_index))
-    }
+    // Note: EventContentId::from_log is used directly for content-based comparison
+    // This avoids relying on log_index which may differ between MiniBlocks and finalized blocks
 
     /// Fetch all relevant events for verification using combined filter
     async fn fetch_all_events(

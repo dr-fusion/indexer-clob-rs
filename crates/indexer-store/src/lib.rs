@@ -12,4 +12,4 @@ pub use pools::PoolStore;
 pub use store::IndexerStore;
 pub use sync_state::{SyncMode, SyncState, SyncStats};
 pub use trades::TradeStore;
-pub use ws_event_buffer::{BufferStats, EventId, WebSocketEventBuffer};
+pub use ws_event_buffer::{BufferStats, EventContentId, EventId, WebSocketEventBuffer};
