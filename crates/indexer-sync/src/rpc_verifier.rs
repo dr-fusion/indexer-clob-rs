@@ -424,27 +424,31 @@ impl RpcVerifier {
         }
     }
 
-    /// Fetch all relevant events for verification using combined filter
+    /// Fetch all relevant events for verification using separate filters
+    /// This matches the exact filtering logic used by WebSocket's is_relevant_log()
     async fn fetch_all_events(
         &self,
         provider: &BoxedProvider,
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<Log>> {
-        // Get all orderbook addresses
-        let orderbook_addresses = self.store.pools.get_all_orderbook_addresses();
+        let mut all_logs = Vec::new();
 
-        // Combine all addresses
-        let mut all_addresses = vec![self.config.pool_manager, self.config.balance_manager];
-        all_addresses.extend(orderbook_addresses);
+        // 1. PoolCreated - ONLY from PoolManager
+        let pool_filter = Filter::new()
+            .address(self.config.pool_manager)
+            .event_signature(PoolCreated::SIGNATURE_HASH)
+            .from_block(from_block)
+            .to_block(to_block);
 
-        // All 11 event signatures
-        let all_topics = vec![
-            PoolCreated::SIGNATURE_HASH,
-            OrderPlaced::SIGNATURE_HASH,
-            OrderMatched::SIGNATURE_HASH,
-            UpdateOrder::SIGNATURE_HASH,
-            OrderCancelled::SIGNATURE_HASH,
+        let pool_logs = provider
+            .get_logs(&pool_filter)
+            .await
+            .map_err(|e| IndexerError::Rpc(format!("{:?}", e)))?;
+        all_logs.extend(pool_logs);
+
+        // 2. Balance events - ONLY from BalanceManager
+        let balance_topics = vec![
             Deposit::SIGNATURE_HASH,
             Withdrawal::SIGNATURE_HASH,
             Lock::SIGNATURE_HASH,
@@ -453,19 +457,43 @@ impl RpcVerifier {
             TransferLockedFrom::SIGNATURE_HASH,
         ];
 
-        let filter = Filter::new()
-            .address(all_addresses)
-            .event_signature(all_topics)
+        let balance_filter = Filter::new()
+            .address(self.config.balance_manager)
+            .event_signature(balance_topics)
             .from_block(from_block)
             .to_block(to_block);
 
-        let mut logs = provider
-            .get_logs(&filter)
+        let balance_logs = provider
+            .get_logs(&balance_filter)
             .await
             .map_err(|e| IndexerError::Rpc(format!("{:?}", e)))?;
+        all_logs.extend(balance_logs);
+
+        // 3. Orderbook events - ONLY from known orderbooks
+        let orderbook_addresses = self.store.pools.get_all_orderbook_addresses();
+        if !orderbook_addresses.is_empty() {
+            let orderbook_topics = vec![
+                OrderPlaced::SIGNATURE_HASH,
+                OrderMatched::SIGNATURE_HASH,
+                UpdateOrder::SIGNATURE_HASH,
+                OrderCancelled::SIGNATURE_HASH,
+            ];
+
+            let orderbook_filter = Filter::new()
+                .address(orderbook_addresses)
+                .event_signature(orderbook_topics)
+                .from_block(from_block)
+                .to_block(to_block);
+
+            let orderbook_logs = provider
+                .get_logs(&orderbook_filter)
+                .await
+                .map_err(|e| IndexerError::Rpc(format!("{:?}", e)))?;
+            all_logs.extend(orderbook_logs);
+        }
 
         // Sort by (block_number, log_index)
-        logs.sort_by(|a, b| {
+        all_logs.sort_by(|a, b| {
             let block_a = a.block_number.unwrap_or(0);
             let block_b = b.block_number.unwrap_or(0);
             let idx_a = a.log_index.unwrap_or(0);
@@ -473,6 +501,6 @@ impl RpcVerifier {
             (block_a, idx_a).cmp(&(block_b, idx_b))
         });
 
-        Ok(logs)
+        Ok(all_logs)
     }
 }
