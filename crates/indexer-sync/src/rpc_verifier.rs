@@ -34,9 +34,6 @@ pub struct VerificationStats {
     pub ws_events_count: usize,
     pub rpc1_events_count: usize,
     pub rpc2_events_count: usize,
-    pub rpc1_valid_content_id: usize,
-    pub rpc2_valid_content_id: usize,
-    pub union_events_count: usize,
     pub missing_events_processed: usize,
     pub duration_ms: u64,
     pub buffer_cleared: bool,
@@ -133,18 +130,12 @@ impl RpcVerifier {
                 Ok(stats) => {
                     if stats.blocks_verified > 0 {
                         info!(
-                            from_block = stats.from_block,
-                            to_block = stats.to_block,
-                            blocks_verified = stats.blocks_verified,
-                            ws_events = stats.ws_events_count,
-                            rpc1_raw = stats.rpc1_events_count,
-                            rpc1_valid = stats.rpc1_valid_content_id,
-                            rpc2_raw = stats.rpc2_events_count,
-                            rpc2_valid = stats.rpc2_valid_content_id,
-                            union_events = stats.union_events_count,
-                            missing_events = stats.missing_events_processed,
+                            blocks = format!("{}-{}", stats.from_block, stats.to_block),
+                            ws_buffer = stats.ws_events_count,
+                            rpc1 = stats.rpc1_events_count,
+                            rpc2 = stats.rpc2_events_count,
+                            missing = stats.missing_events_processed,
                             duration_ms = stats.duration_ms,
-                            buffer_cleared = stats.buffer_cleared,
                             "Verification cycle complete"
                         );
 
@@ -172,21 +163,12 @@ impl RpcVerifier {
             // Build RPC info based on whether secondary RPC is configured
             let rpc_info = if stats.rpc2_events_count > 0 {
                 format!(
-                    "RPC1: {} raw / {} valid\n\
-                     RPC2: {} raw / {} valid\n\
-                     Union: {}",
+                    "RPC1: {}\nRPC2: {}",
                     stats.rpc1_events_count,
-                    stats.rpc1_valid_content_id,
-                    stats.rpc2_events_count,
-                    stats.rpc2_valid_content_id,
-                    stats.union_events_count
+                    stats.rpc2_events_count
                 )
             } else {
-                format!(
-                    "RPC: {} raw / {} valid",
-                    stats.rpc1_events_count,
-                    stats.rpc1_valid_content_id
-                )
+                format!("RPC: {}", stats.rpc1_events_count)
             };
 
             let message = format!(
@@ -298,35 +280,22 @@ impl RpcVerifier {
         let mut rpc_logs_map: std::collections::HashMap<EventContentId, Log> =
             std::collections::HashMap::new();
 
-        let mut rpc1_valid_content_id = 0usize;
         for log in &rpc1_logs {
             if let Some(content_id) = EventContentId::from_log(log) {
-                rpc1_valid_content_id += 1;
                 all_rpc_events.insert(content_id.clone());
                 rpc_logs_map.insert(content_id, log.clone());
-            } else {
-                debug!(
-                    block = ?log.block_number,
-                    log_index = ?log.log_index,
-                    has_tx_hash = log.transaction_hash.is_some(),
-                    "RPC1 log missing tx_hash - cannot create EventContentId"
-                );
             }
         }
 
-        let mut rpc2_valid_content_id = 0usize;
         if let Some(ref logs) = rpc2_logs {
             for log in logs {
                 if let Some(content_id) = EventContentId::from_log(log) {
-                    rpc2_valid_content_id += 1;
                     all_rpc_events.insert(content_id.clone());
                     // Only insert if not already present (prefer primary RPC log)
                     rpc_logs_map.entry(content_id).or_insert_with(|| log.clone());
                 }
             }
         }
-
-        let union_events_count = all_rpc_events.len();
 
         // Find events in RPC but not in WebSocket buffer (by content, not log_index)
         let mut missing_count = 0;
@@ -397,9 +366,6 @@ impl RpcVerifier {
             ws_events_count,
             rpc1_events_count,
             rpc2_events_count,
-            rpc1_valid_content_id,
-            rpc2_valid_content_id,
-            union_events_count,
             missing_events_processed: missing_count,
             duration_ms,
             buffer_cleared: should_clear,
