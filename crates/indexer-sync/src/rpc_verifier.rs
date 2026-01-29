@@ -32,8 +32,8 @@ pub struct VerificationStats {
     pub to_block: u64,
     pub blocks_verified: u64,
     pub ws_events_count: usize,
-    pub rpc1_events_count: usize,
-    pub rpc2_events_count: usize,
+    /// Number of unique RPC events (deduplicated, with valid EventContentId)
+    pub rpc_events_count: usize,
     pub missing_events_processed: usize,
     pub duration_ms: u64,
     pub buffer_cleared: bool,
@@ -132,8 +132,7 @@ impl RpcVerifier {
                         info!(
                             blocks = format!("{}-{}", stats.from_block, stats.to_block),
                             ws_buffer = stats.ws_events_count,
-                            rpc1 = stats.rpc1_events_count,
-                            rpc2 = stats.rpc2_events_count,
+                            rpc_events = stats.rpc_events_count,
                             missing = stats.missing_events_processed,
                             duration_ms = stats.duration_ms,
                             "Verification cycle complete"
@@ -160,30 +159,19 @@ impl RpcVerifier {
     /// Send a Telegram alert for missing events
     async fn send_telegram_alert(&self, stats: &VerificationStats) {
         if let Some(ref notifier) = self.telegram_notifier {
-            // Build RPC info based on whether secondary RPC is configured
-            let rpc_info = if stats.rpc2_events_count > 0 {
-                format!(
-                    "RPC1: {}\nRPC2: {}",
-                    stats.rpc1_events_count,
-                    stats.rpc2_events_count
-                )
-            } else {
-                format!("RPC: {}", stats.rpc1_events_count)
-            };
-
             let message = format!(
                 "🚨 <b>Missing Events Detected</b>\n\n\
                  Chain: {}\n\
                  Blocks: {} - {}\n\
                  Missing: {}\n\
                  WS Buffer: {}\n\
-                 {}",
+                 RPC Events: {}",
                 self.config.chain_id,
                 stats.from_block,
                 stats.to_block,
                 stats.missing_events_processed,
                 stats.ws_events_count,
-                rpc_info,
+                stats.rpc_events_count,
             );
 
             notifier.send_message(&message).await;
@@ -250,11 +238,10 @@ impl RpcVerifier {
         };
 
         // Check if both fetches succeeded
-        let (rpc1_logs, rpc1_events_count) = match rpc1_result {
+        let rpc1_logs = match rpc1_result {
             Ok(logs) => {
                 self.batch_controller.report_success();
-                let count = logs.len();
-                (logs, count)
+                logs
             }
             Err(e) => {
                 self.batch_controller.report_error();
@@ -263,16 +250,13 @@ impl RpcVerifier {
             }
         };
 
-        let (rpc2_logs, rpc2_events_count) = match rpc2_result {
-            Some(Ok(logs)) => {
-                let count = logs.len();
-                (Some(logs), count)
-            }
+        let rpc2_logs = match rpc2_result {
+            Some(Ok(logs)) => Some(logs),
             Some(Err(e)) => {
                 warn!(error = %e, "Secondary RPC fetch failed - will only use primary RPC");
-                (None, 0)
+                None
             }
-            None => (None, 0),
+            None => None,
         };
 
         // Union of both RPC results (dedupe by EventContentId - content-based comparison)
@@ -364,8 +348,7 @@ impl RpcVerifier {
             to_block,
             blocks_verified: to_block - start_block + 1,
             ws_events_count,
-            rpc1_events_count,
-            rpc2_events_count,
+            rpc_events_count: all_rpc_events.len(),
             missing_events_processed: missing_count,
             duration_ms,
             buffer_cleared: should_clear,
